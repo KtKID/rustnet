@@ -23,6 +23,7 @@ pub(super) struct SnapshotEnvelope {
     filter: Option<String>,
     connection_count: usize,
     connections: Vec<ConnectionSnapshot>,
+    socket_inventory: HostInventorySnapshot,
 }
 
 impl SnapshotEnvelope {
@@ -62,9 +63,99 @@ impl SnapshotEnvelope {
                 filter: filter.map(str::to_string),
                 connection_count: connections.len(),
                 connections,
+                socket_inventory: HostInventorySnapshot::from_snapshot(&app.get_socket_snapshot()),
             },
         )
     }
+}
+
+/// Unfiltered host inventory, independent from packet-derived connections.
+/// Only existing host facts are exported. The scan-evidence timestamp may be
+/// absent for partial/unprivileged inventories; the envelope timestamp is the
+/// output time, not a socket-open or process-start timestamp.
+#[derive(Serialize)]
+struct HostInventorySnapshot {
+    closure_scan_started: Option<String>,
+    socket_count: usize,
+    sockets: Vec<HostSocketSnapshot>,
+}
+
+impl HostInventorySnapshot {
+    fn from_snapshot(snapshot: &rustnet_host::SocketSnapshot) -> Self {
+        let mut sockets: Vec<_> = snapshot
+            .sockets
+            .iter()
+            .map(HostSocketSnapshot::from_socket)
+            .collect();
+        sockets.sort_by_cached_key(|socket| {
+            format!(
+                "{}:{}:{}:{:?}:{:?}",
+                socket.protocol,
+                socket.local.ip,
+                socket.local.port,
+                socket.remote,
+                socket.owner.as_ref().map(|owner| owner.pid)
+            )
+        });
+        Self {
+            closure_scan_started: snapshot.closure_scan_started.map(timestamp),
+            socket_count: sockets.len(),
+            sockets,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HostSocketSnapshot {
+    protocol: String,
+    local: HostEndpointSnapshot,
+    remote: Option<HostEndpointSnapshot>,
+    state: String,
+    owner: Option<HostOwnerSnapshot>,
+    // Native identities can exceed JavaScript's exact integer range.
+    native_id: Option<String>,
+}
+
+impl HostSocketSnapshot {
+    fn from_socket(socket: &rustnet_host::HostSocket) -> Self {
+        Self {
+            protocol: socket.protocol.to_string(),
+            local: HostEndpointSnapshot::from_addr(socket.local_addr),
+            remote: socket.remote_addr.map(HostEndpointSnapshot::from_addr),
+            state: match socket.state {
+                rustnet_host::HostSocketState::Tcp(state) => state.to_string(),
+                rustnet_host::HostSocketState::UdpBound => "BOUND".to_string(),
+            },
+            owner: socket.owner.as_ref().map(|owner| HostOwnerSnapshot {
+                pid: owner.pid,
+                name: owner.name.clone(),
+                uid: owner.uid,
+            }),
+            native_id: socket.native_id.map(|id| id.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HostEndpointSnapshot {
+    ip: String,
+    port: u16,
+}
+
+impl HostEndpointSnapshot {
+    fn from_addr(addr: std::net::SocketAddr) -> Self {
+        Self {
+            ip: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HostOwnerSnapshot {
+    pid: u32,
+    name: String,
+    uid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -549,6 +640,67 @@ mod tests {
     use crate::network::types::{Protocol, ProtocolState, TcpState};
 
     #[test]
+    fn host_inventory_exports_idle_listeners_udp_and_all_socket_facts() {
+        use crate::network::types::Protocol;
+        use rustnet_host::{
+            HostSocket, HostSocketState, HostTcpState, SocketOwner, SocketSnapshot,
+        };
+        let inventory = SocketSnapshot::new(vec![
+            HostSocket {
+                protocol: Protocol::Tcp,
+                local_addr: "0.0.0.0:8080".parse().unwrap(),
+                remote_addr: None,
+                state: HostSocketState::Tcp(HostTcpState::Listen),
+                owner: Some(SocketOwner::new(42, "example", Some(501))),
+                native_id: Some(u64::MAX),
+            },
+            HostSocket {
+                protocol: Protocol::Udp,
+                local_addr: "[::]:5353".parse().unwrap(),
+                remote_addr: Some("[2001:db8::1]:5353".parse().unwrap()),
+                state: HostSocketState::UdpBound,
+                owner: None,
+                native_id: None,
+            },
+            HostSocket {
+                protocol: Protocol::Tcp,
+                local_addr: "127.0.0.1:50000".parse().unwrap(),
+                remote_addr: Some("127.0.0.1:8080".parse().unwrap()),
+                state: HostSocketState::Tcp(HostTcpState::Established),
+                owner: None,
+                native_id: None,
+            },
+        ]);
+        let value = serde_json::to_value(HostInventorySnapshot::from_snapshot(&inventory)).unwrap();
+        assert_eq!(value["socket_count"], 3);
+        assert!(value["closure_scan_started"].is_null());
+        let rows = value["sockets"].as_array().unwrap();
+        let listener = rows.iter().find(|row| row["state"] == "LISTEN").unwrap();
+        assert_eq!(
+            listener["local"],
+            serde_json::json!({"ip":"0.0.0.0","port":8080})
+        );
+        assert_eq!(
+            listener["owner"],
+            serde_json::json!({"pid":42,"name":"example","uid":501})
+        );
+        assert!(listener["remote"].is_null());
+        assert_eq!(listener["native_id"], u64::MAX.to_string());
+        let udp = rows.iter().find(|row| row["state"] == "BOUND").unwrap();
+        assert_eq!(udp["protocol"], "UDP");
+        assert_eq!(udp["local"]["ip"], "::");
+        assert_eq!(udp["remote"]["ip"], "2001:db8::1");
+        assert!(udp["owner"].is_null());
+        assert!(rows.iter().any(|row| row["state"] == "ESTAB"));
+        let empty = serde_json::to_value(HostInventorySnapshot::from_snapshot(
+            &SocketSnapshot::default(),
+        ))
+        .unwrap();
+        assert_eq!(empty["socket_count"], 0);
+        assert_eq!(empty["sockets"], serde_json::json!([]));
+    }
+
+    #[test]
     fn capture_totals_survive_stats_snapshot_and_reset_in_wire_output() {
         let stats = AppStats::default();
         stats.packets_captured.store(3, Ordering::Relaxed);
@@ -621,6 +773,7 @@ mod tests {
                 "runtime",
                 "sandbox",
                 "schema_version",
+                "socket_inventory",
                 "stats",
                 "timestamp",
                 "type",
