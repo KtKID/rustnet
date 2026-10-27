@@ -86,6 +86,48 @@ pub fn build_cli() -> Command {
                 .required(false),
         )
         .arg(
+            Arg::new("traffic-interval-ms")
+                .long("traffic-interval-ms")
+                .value_name("MILLISECONDS")
+                .help("Normal live traffic counter check interval")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .requires_all(["headless", "traffic-upload-bps", "traffic-download-bps"]),
+        )
+        .arg(
+            Arg::new("traffic-alert-interval-ms")
+                .long("traffic-alert-interval-ms")
+                .value_name("MILLISECONDS")
+                .help("Traffic check interval after any process exceeds its limit")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .requires_all(["headless", "traffic-upload-bps", "traffic-download-bps", "traffic-interval-ms", "traffic-alert-cooldown-ms"]),
+        )
+        .arg(
+            Arg::new("traffic-alert-cooldown-ms")
+                .long("traffic-alert-cooldown-ms")
+                .value_name("MILLISECONDS")
+                .help("Consecutive quiet time before restoring the normal interval")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .requires_all(["headless", "traffic-upload-bps", "traffic-download-bps", "traffic-interval-ms", "traffic-alert-interval-ms"]),
+        )
+        .arg(
+            Arg::new("traffic-upload-bps")
+                .long("traffic-upload-bps")
+                .value_name("BYTES_PER_SECOND")
+                .help("Record per-process traffic exceeding this upload rate")
+                .value_parser(parse_traffic_threshold)
+                .requires_all(["headless", "traffic-download-bps", "traffic-interval-ms", "traffic-alert-interval-ms", "traffic-alert-cooldown-ms"])
+                .conflicts_with_all(["output", "filter", "json-log"]),
+        )
+        .arg(
+            Arg::new("traffic-download-bps")
+                .long("traffic-download-bps")
+                .value_name("BYTES_PER_SECOND")
+                .help("Record per-process traffic exceeding this download rate")
+                .value_parser(parse_traffic_threshold)
+                .requires_all(["headless", "traffic-upload-bps", "traffic-interval-ms", "traffic-alert-interval-ms", "traffic-alert-cooldown-ms"])
+                .conflicts_with_all(["output", "filter", "json-log"]),
+        )
+        .arg(
             Arg::new("refresh-interval")
                 .short('r')
                 .long("refresh-interval")
@@ -257,6 +299,14 @@ pub fn build_cli() -> Command {
     cmd
 }
 
+fn parse_traffic_threshold(value: &str) -> Result<f64, String> {
+    let threshold: f64 = value.parse().map_err(|_| "expected a numeric rate")?;
+    if !threshold.is_finite() || threshold < 0.0 {
+        return Err("expected a finite nonnegative bytes/second rate".to_string());
+    }
+    Ok(threshold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +369,93 @@ mod tests {
         assert_eq!(matches.get_one::<u64>("duration"), None);
         assert_eq!(matches.get_one::<String>("output"), None);
         assert_eq!(matches.get_one::<String>("filter"), None);
+    }
+
+    #[test]
+    fn process_traffic_thresholds_parse_independently() {
+        let matches = build_cli()
+            .try_get_matches_from([
+                "rustnet",
+                "--headless",
+                "--traffic-upload-bps",
+                "5000000",
+                "--traffic-download-bps",
+                "12000000",
+                "--traffic-interval-ms",
+                "100",
+                "--traffic-alert-interval-ms",
+                "40",
+                "--traffic-alert-cooldown-ms",
+                "10000",
+            ])
+            .expect("independent traffic thresholds should parse");
+        assert_eq!(
+            matches.get_one::<f64>("traffic-upload-bps"),
+            Some(&5_000_000.0)
+        );
+        assert_eq!(
+            matches.get_one::<f64>("traffic-download-bps"),
+            Some(&12_000_000.0)
+        );
+        assert_eq!(matches.get_one::<u64>("traffic-interval-ms"), Some(&100));
+        assert_eq!(
+            matches.get_one::<u64>("traffic-alert-interval-ms"),
+            Some(&40)
+        );
+        assert_eq!(
+            matches.get_one::<u64>("traffic-alert-cooldown-ms"),
+            Some(&10000)
+        );
+        assert_eq!(matches.get_one::<u64>("refresh-interval"), Some(&500));
+    }
+
+    #[test]
+    fn process_traffic_thresholds_require_complete_finite_configuration() {
+        for args in [
+            vec![
+                "rustnet",
+                "--traffic-upload-bps",
+                "5",
+                "--traffic-download-bps",
+                "5",
+            ],
+            vec!["rustnet", "--headless", "--traffic-upload-bps", "5"],
+            vec![
+                "rustnet",
+                "--headless",
+                "--traffic-upload-bps",
+                "NaN",
+                "--traffic-download-bps",
+                "5",
+            ],
+            vec![
+                "rustnet",
+                "--headless",
+                "--traffic-upload-bps",
+                "inf",
+                "--traffic-download-bps",
+                "5",
+            ],
+            vec![
+                "rustnet",
+                "--headless",
+                "--traffic-upload-bps=-1",
+                "--traffic-download-bps",
+                "5",
+            ],
+            vec![
+                "rustnet",
+                "--headless",
+                "--traffic-upload-bps",
+                "5",
+                "--traffic-download-bps",
+                "5",
+                "--json-log",
+                "ordinary.jsonl",
+            ],
+        ] {
+            assert!(build_cli().try_get_matches_from(args).is_err());
+        }
     }
 
     #[test]

@@ -470,6 +470,25 @@ impl App {
         self.snapshot_generation.load(Ordering::Acquire)
     }
 
+    /// Read live and recently-closed traffic counters independently of UI
+    /// publication. The retained-view guard keeps retirement from moving a
+    /// flow between maps during a scan; packet counters keep per-entry locks.
+    pub(crate) fn visit_traffic_connections(&self, mut inspect: impl FnMut(&Connection)) {
+        self.tracker.with_retained_sources(|active, historic| {
+            for entry in active {
+                inspect(entry.value());
+            }
+            for entry in historic {
+                inspect(entry.value());
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn traffic_tracker_for_test(&self) -> Arc<ConnectionTracker> {
+        Arc::clone(&self.tracker)
+    }
+
     /// Polling cadence for consumers of the published connection snapshot.
     pub(crate) fn snapshot_refresh_interval(&self) -> Duration {
         Duration::from_millis(self.config.refresh_interval)

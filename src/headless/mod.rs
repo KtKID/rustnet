@@ -15,6 +15,9 @@ use crate::app::{App, StopReport};
 
 mod output;
 mod schema;
+mod traffic;
+
+pub use traffic::{TrafficCadence, TrafficThresholds, run_process_traffic};
 
 use output::AsyncOutput;
 use schema::{RuntimePhase, SnapshotEnvelope};

@@ -190,7 +190,7 @@ impl RuntimePhase {
 }
 
 #[derive(Serialize)]
-struct RuntimeSnapshot {
+pub(super) struct RuntimeSnapshot {
     status: &'static str,
     snapshot_generation: u64,
     interface: Option<String>,
@@ -202,7 +202,7 @@ struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
-    fn new(
+    pub(super) fn new(
         app: &App,
         generation: u64,
         phase: RuntimePhase,
@@ -291,7 +291,7 @@ impl SandboxSnapshot {
 }
 
 #[derive(Serialize)]
-struct StatsSnapshot {
+pub(super) struct StatsSnapshot {
     packets_captured: u64,
     bytes_captured: u64,
     packets_processed: u64,
@@ -316,7 +316,7 @@ struct StatsSnapshot {
 }
 
 impl StatsSnapshot {
-    fn from_stats(stats: &AppStats) -> Self {
+    pub(super) fn from_stats(stats: &AppStats) -> Self {
         let load = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
         Self {
             packets_captured: load(&stats.packets_captured),
@@ -345,7 +345,7 @@ impl StatsSnapshot {
 }
 
 #[derive(Serialize)]
-struct ConnectionSnapshot {
+pub(super) struct ConnectionSnapshot {
     id: String,
     protocol: &'static str,
     state: String,
@@ -354,7 +354,7 @@ struct ConnectionSnapshot {
     remote_is_gateway: bool,
     observed_vlan_ids: Vec<u16>,
     direction: Option<&'static str>,
-    process: Option<ProcessSnapshot>,
+    pub(super) process: Option<ProcessSnapshot>,
     service: Option<String>,
     application: Option<&'static str>,
     hostname: Option<String>,
@@ -371,7 +371,7 @@ struct ConnectionSnapshot {
 }
 
 impl ConnectionSnapshot {
-    fn from_connection(connection: &Connection) -> Self {
+    pub(super) fn from_connection(connection: &Connection) -> Self {
         let authoritative_hostname = connection.authoritative_hostname();
         let (hostname, hostname_source) = if let Some(hostname) = authoritative_hostname {
             (Some(hostname.to_string()), Some("application"))
@@ -530,7 +530,7 @@ struct EndpointSnapshot {
 }
 
 #[derive(Serialize)]
-struct ProcessSnapshot {
+pub(super) struct ProcessSnapshot {
     pid: Option<u32>,
     ppid: Option<u32>,
     name: Option<String>,
@@ -606,7 +606,7 @@ struct KubernetesSnapshot {
     cgroup_path: Option<String>,
 }
 
-fn timestamp(time: SystemTime) -> String {
+pub(super) fn timestamp(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 

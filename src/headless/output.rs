@@ -84,6 +84,32 @@ impl<T: Serialize + Send + 'static> AsyncOutput<T> {
         });
     }
 
+    /// Event records preserve queue order. A slow consumer fails visibly
+    /// instead of replacing an earlier event with a newer one.
+    pub(super) fn offer_event(&mut self, value: T) -> Result<()> {
+        self.records_tx
+            .try_send(OutputRecord {
+                value,
+                terminal: false,
+            })
+            .map_err(|_| anyhow::anyhow!("headless event output is blocked or disconnected"))
+    }
+
+    pub(super) fn finish_events(mut self, terminal: T, deadline: Duration) -> Result<()> {
+        self.records_tx
+            .send_timeout(
+                OutputRecord {
+                    value: terminal,
+                    terminal: true,
+                },
+                deadline,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("headless event output could not queue terminal record")
+            })?;
+        self.wait_for_finish(deadline)
+    }
+
     fn replace_pending(&mut self, mut record: OutputRecord<T>) {
         loop {
             match self.records_tx.try_send(record) {
@@ -127,6 +153,10 @@ impl<T: Serialize + Send + 'static> AsyncOutput<T> {
             value: terminal,
             terminal: true,
         });
+        self.wait_for_finish(deadline)
+    }
+
+    fn wait_for_finish(&mut self, deadline: Duration) -> Result<()> {
         let status = if let Some(status) = self.observed_status.take() {
             status
         } else {

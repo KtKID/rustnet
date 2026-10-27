@@ -17,6 +17,7 @@ use std::time::Duration;
 pub fn run() -> Result<()> {
     let matches = cli::build_cli().get_matches();
     let headless = matches.get_flag("headless");
+    let traffic_cadence = read_traffic_cadence(&matches)?;
 
     // Never start terminal control or privileged capture accidentally from a
     // pipe, scheduler, or service. Machine consumers must opt in explicitly.
@@ -372,7 +373,7 @@ pub fn run() -> Result<()> {
     app.start_workers(worker_startup_permit)?;
 
     if headless {
-        return run_headless(&matches, &mut app);
+        return run_headless(&matches, &mut app, traffic_cadence);
     }
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -391,7 +392,31 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn run_headless(matches: &clap::ArgMatches, app: &mut app::App) -> Result<()> {
+fn read_traffic_cadence(
+    matches: &clap::ArgMatches,
+) -> Result<Option<crate::headless::TrafficCadence>> {
+    if matches.get_one::<f64>("traffic-upload-bps").is_none() {
+        return Ok(None);
+    }
+    let duration = |name: &str| -> Result<Duration> {
+        Ok(Duration::from_millis(
+            *matches
+                .get_one::<u64>(name)
+                .context("missing traffic cadence option")?,
+        ))
+    };
+    Ok(Some(crate::headless::TrafficCadence::new(
+        duration("traffic-interval-ms")?,
+        duration("traffic-alert-interval-ms")?,
+        duration("traffic-alert-cooldown-ms")?,
+    )?))
+}
+
+fn run_headless(
+    matches: &clap::ArgMatches,
+    app: &mut app::App,
+    traffic_cadence: Option<crate::headless::TrafficCadence>,
+) -> Result<()> {
     let format = matches
         .get_one::<String>("output")
         .map(|value| value.parse::<crate::headless::HeadlessFormat>())
@@ -405,7 +430,25 @@ fn run_headless(matches: &clap::ArgMatches, app: &mut app::App) -> Result<()> {
             .map(|seconds| Duration::from_secs(*seconds)),
         filter_query: matches.get_one::<String>("filter").cloned(),
     };
-    let stop_report = match crate::headless::run(app, io::stdout(), &options, &SHUTDOWN_REQUESTED) {
+    let result = if let (Some(upload), Some(download)) = (
+        matches.get_one::<f64>("traffic-upload-bps"),
+        matches.get_one::<f64>("traffic-download-bps"),
+    ) {
+        crate::headless::run_process_traffic(
+            app,
+            io::stdout(),
+            &options,
+            crate::headless::TrafficThresholds {
+                upload: *upload,
+                download: *download,
+            },
+            traffic_cadence.context("missing validated traffic cadence")?,
+            &SHUTDOWN_REQUESTED,
+        )
+    } else {
+        crate::headless::run(app, io::stdout(), &options, &SHUTDOWN_REQUESTED)
+    };
+    let stop_report = match result {
         Ok(outcome) => outcome,
         Err(error) => {
             let stop_report = app.stop();

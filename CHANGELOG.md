@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Run Windows CI tests independently and start DEB installation checks after GNU/Linux builds, preserving all existing checks (#686)
 
 ### Added
+- Add optional per-process upload/download threshold monitoring before snapshot serialization, with ordered anomaly records and a final health summary. The independent `--traffic-interval-ms` cadence measures live counter deltas, including recently closed flows, and reports check timing. Explicit `--traffic-alert-interval-ms` and `--traffic-alert-cooldown-ms` configure faster checks after a hit and quiet-time recovery while preserving byte baselines.
 - Add shared Host timeframes for network events and interface errors, keeping cumulative totals visible
 - Show per-resolver DNS health, retries, pending age, selectable 60s/5m/1h/since-startup windows, and 15-minute recent issue evidence in Host
 - Log cached local listening/bound port status on incoming new TCP/UDP connections (#682)

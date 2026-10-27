@@ -9,10 +9,10 @@ use std::io;
 use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Clone, Default)]
-struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+pub(super) struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
 impl SharedWriter {
-    fn bytes(&self) -> Vec<u8> {
+    pub(super) fn bytes(&self) -> Vec<u8> {
         self.0.lock().unwrap().clone()
     }
 }
