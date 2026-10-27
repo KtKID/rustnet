@@ -94,7 +94,7 @@ mod tests {
     fn option(kind: u8, payload: &[u8]) -> Vec<u8> {
         let mut opt = vec![kind, ((payload.len() + 2).div_ceil(8)) as u8];
         opt.extend_from_slice(payload);
-        while opt.len() % 8 != 0 {
+        while !opt.len().is_multiple_of(8) {
             opt.push(0);
         }
         opt

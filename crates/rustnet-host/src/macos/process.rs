@@ -1,24 +1,22 @@
-//! macOS lsof-based process lookup.
+//! macOS in-process libproc socket and process lookup.
 
 use crate::{
     ConnectionKey, DegradationReason, HostSocket, MatchQuality, ProcessAncestor,
     ProcessAttribution, ProcessLineage, ProcessLookup, SocketOwner, SocketScan, SocketSnapshot,
-    ancestor_display_name, collect_process_lineage,
-    command::{PROCESS_TABLE_COMMAND_TIMEOUT, output_with_timeout_or_cancel},
-    decode_process_name, owner_match, path_from_c_buffer,
+    ancestor_display_name, collect_process_lineage, decode_process_name, owner_match,
+    path_from_c_buffer,
 };
 use anyhow::Result;
-use log::{debug, error, info, warn};
+#[cfg(test)]
+use log::error;
+use log::{debug, info, warn};
 use rustnet_core::network::types::Connection;
 use std::collections::HashMap;
 use std::mem::{MaybeUninit, size_of};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
-
-const LSOF_PATH: &str = "/usr/sbin/lsof";
 
 pub(super) struct MacOSProcessLookup {
     cache: RwLock<HashMap<ConnectionKey, SocketOwner>>,
@@ -29,7 +27,7 @@ pub(super) struct ProcessDetails {
     pub(super) ppid: u32,
     pub(super) uid: u32,
     pub(super) gid: u32,
-    name: String,
+    pub(super) name: String,
     started_at_unix_ms: Option<u64>,
 }
 
@@ -138,8 +136,8 @@ impl MacOSProcessLookup {
         // PKTAP switch), while an empty scan is retried by the periodic
         // refresh a few seconds later.
         let started = SystemTime::now();
-        let scan = Self::parse_lsof(None).unwrap_or_else(|e| {
-            warn!("Initial lsof scan failed, deferring to periodic refresh: {e}");
+        let scan = super::native::scan(None).unwrap_or_else(|e| {
+            warn!("Initial native socket scan failed, deferring to periodic refresh: {e}");
             SocketScan::default()
         });
         Ok(Self {
@@ -156,20 +154,7 @@ impl MacOSProcessLookup {
         }
     }
 
-    fn parse_lsof(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
-        info!("Running lsof to get network connections");
-
-        let output = output_with_timeout_or_cancel(
-            Command::new(LSOF_PATH)
-                .args(["-i", "-n", "-P", "-l", "+c", "0"])
-                .env("LC_ALL", "C"),
-            PROCESS_TABLE_COMMAND_TIMEOUT,
-            cancelled,
-        )?;
-
-        Self::parse_lsof_result(&output)
-    }
-
+    #[cfg(test)]
     fn parse_lsof_result(output: &std::process::Output) -> Result<SocketScan> {
         // With one unrestricted Internet selector, exit 1 and no output
         // means no matching sockets. Actual diagnostics remain failures.
@@ -218,7 +203,7 @@ impl MacOSProcessLookup {
     fn refresh_cache(&self, cancelled: Option<&AtomicBool>) -> Result<()> {
         info!("Refreshing macOS process lookup cache");
         let started = SystemTime::now();
-        let scan = Self::parse_lsof(cancelled)?;
+        let scan = super::native::scan(cancelled)?;
         let cache_size = scan.lookup.len();
         *self.cache.write().expect("cache lock poisoned") = scan.lookup;
         *self
@@ -257,7 +242,7 @@ impl ProcessLookup for MacOSProcessLookup {
     }
 
     fn get_detection_method(&self) -> &str {
-        "lsof"
+        "libproc"
     }
 
     fn get_degradation_reason(&self) -> DegradationReason {

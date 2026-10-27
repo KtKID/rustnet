@@ -104,12 +104,10 @@ const SBPL_PROFILE_BASE: &str = r#"(version 1)
 
 /// Trailing SBPL section: exec deny (independent of configured paths).
 const SBPL_PROFILE_EXEC: &str = r#"
-;; Block execution of all binaries except lsof
+;; Capture authorization completes before sandboxing; sampling uses native APIs.
 ;; Prevents shell escapes (/bin/sh, /usr/bin/curl, etc.) if code execution
 ;; is achieved through a DPI parsing vulnerability.
 (deny process-exec)
-(allow process-exec
-    (literal "/usr/sbin/lsof"))
 "#;
 
 /// Network deny SBPL section, appended when `block_network` is true.
@@ -176,6 +174,13 @@ fn build_sbpl_profile(config: &SandboxConfig, allow_dns_resolution: bool) -> Str
         );
     }
 
+    for path in &config.write_paths {
+        let path = sbpl_path(path);
+        let _ = write!(
+            profile,
+            "\n(allow file-write* (literal \"{path}\") (subpath \"{path}\"))\n(allow file-read-data (literal \"{path}\") (subpath \"{path}\"))\n"
+        );
+    }
     profile.push_str(SBPL_PROFILE_EXEC);
     profile.push_str(&build_sbpl_network_profile(config, allow_dns_resolution));
     profile
@@ -298,6 +303,7 @@ mod tests {
             mode: SandboxMode::BestEffort,
             block_network,
             read_paths: read.iter().map(PathBuf::from).collect(),
+            write_paths: Vec::new(),
             drop_uid: None,
         }
     }
@@ -372,7 +378,7 @@ mod tests {
     fn test_profile_includes_process_exec_deny() {
         let profile = build_sbpl_profile(&config(&[], false), false);
         assert!(profile.contains("(deny process-exec)"));
-        assert!(profile.contains(r#"(literal "/usr/sbin/lsof")"#));
+        assert!(!profile.contains("(allow process-exec"));
     }
 
     #[test]

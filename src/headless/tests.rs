@@ -440,6 +440,32 @@ fn superseded_snapshots_are_dropped_without_serialization_and_terminal_is_writte
 }
 
 #[test]
+fn full_output_uses_the_configured_shutdown_deadline() {
+    let (writer, _output, _entered, release, finished) = stalled_writer();
+    let mut app = App::new(Config {
+        resolve_dns: false,
+        output_shutdown_deadline_ms: 30,
+        ..Config::default()
+    })
+    .unwrap();
+    let started = Instant::now();
+    let result = run(
+        &mut app,
+        writer,
+        &HeadlessOptions {
+            format: HeadlessFormat::Json,
+            duration: Some(Duration::ZERO),
+            filter_query: None,
+        },
+        &AtomicBool::new(false),
+    );
+    release.send(()).unwrap();
+    finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(result.unwrap_err().to_string().contains("within 30ms"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
 fn stalled_writer_cannot_block_duration_shutdown() {
     let (writer, _output, entered, release, finished) = stalled_writer();
     let mut app = app_with_connections();

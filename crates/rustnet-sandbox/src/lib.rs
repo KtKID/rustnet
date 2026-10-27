@@ -133,6 +133,8 @@ pub struct SandboxConfig {
     pub block_network: bool,
     /// Paths that need read access after sandboxing (e.g., GeoIP databases)
     pub read_paths: Vec<PathBuf>,
+    /// Explicit collector output directories for lazy files and atomic replacement.
+    pub write_paths: Vec<PathBuf>,
     /// When running as root: the identity to drop to after initialization
     /// (`None` = not root, or drop disabled via `--no-uid-drop`)
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]

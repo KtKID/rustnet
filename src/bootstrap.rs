@@ -16,6 +16,76 @@ use std::time::Duration;
 /// Parse CLI options and initialize the selected frontend.
 pub fn run() -> Result<()> {
     let matches = cli::build_cli().get_matches();
+    run_inner(matches, None)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_collector(
+    session: std::sync::Arc<std::sync::Mutex<crate::collector::Session>>,
+    paths: crate::collector::Paths,
+    status: serde_json::Value,
+) -> Result<()> {
+    let config = session.lock().unwrap().config.clone();
+    let mut args = vec![
+        "x-net-collector".to_string(),
+        "--headless".into(),
+        "--refresh-interval".into(),
+        config.sampling.snapshot_interval_ms.to_string(),
+    ];
+    if config.capture.show_localhost {
+        args.push("--show-localhost".into());
+    } else {
+        args.push("--no-localhost".into());
+    }
+    if config.capture.show_ptr_lookups {
+        args.push("--show-ptr-lookups".into());
+    }
+    if let Some(interface) = &config.capture.interface {
+        args.extend(["--interface".into(), interface.clone()]);
+    }
+    if let Some(seconds) = config.duration_seconds {
+        args.extend(["--duration".into(), seconds.to_string()]);
+    }
+    if config.mode == crate::collector::config::Mode::Anomalies {
+        args.extend([
+            "--traffic-upload-bps".into(),
+            (config.thresholds.upload_mb_s * 1_000_000.0).to_string(),
+            "--traffic-download-bps".into(),
+            (config.thresholds.download_mb_s * 1_000_000.0).to_string(),
+            "--traffic-interval-ms".into(),
+            config.sampling.traffic_interval_ms.to_string(),
+            "--traffic-alert-interval-ms".into(),
+            config.sampling.traffic_alert_interval_ms.to_string(),
+            "--traffic-alert-cooldown-ms".into(),
+            config.sampling.traffic_alert_cooldown_ms.to_string(),
+        ]);
+    } else {
+        args.extend([
+            "--json-log".into(),
+            session
+                .lock()
+                .unwrap()
+                .directory
+                .join("connections.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+    }
+    let matches = cli::build_cli().try_get_matches_from(args)?;
+    run_inner(matches, Some((session, paths, status)))
+}
+
+#[cfg(target_os = "macos")]
+type CollectorContext = (
+    std::sync::Arc<std::sync::Mutex<crate::collector::Session>>,
+    crate::collector::Paths,
+    serde_json::Value,
+);
+#[cfg(not(target_os = "macos"))]
+type CollectorContext = ();
+fn run_inner(matches: clap::ArgMatches, collector: Option<CollectorContext>) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = &collector;
     let headless = matches.get_flag("headless");
     let traffic_cadence = read_traffic_cadence(&matches)?;
 
@@ -33,6 +103,16 @@ pub fn run() -> Result<()> {
         pcapng_export_file: matches.get_one::<String>("pcapng-export").cloned(),
         ..app::Config::default()
     };
+    #[cfg(target_os = "macos")]
+    if let Some((session, _, _)) = &collector {
+        let s = session.lock().unwrap().config.sampling.clone();
+        config.socket_refresh_interval_ms = s.socket_interval_ms;
+        config.enrichment_interval_ms = s.enrichment_interval_ms;
+        config.enrichment_full_interval_ms = s.enrichment_full_interval_ms;
+        let storage = session.lock().unwrap().config.storage.clone();
+        config.event_output_queue_capacity = storage.event_queue_capacity;
+        config.output_shutdown_deadline_ms = storage.flush_timeout_ms;
+    }
     // Validate before logging, Npcap loading, privilege checks, or output
     // creation so a bad combination cannot truncate an existing destination,
     // including a regular file inherited as stdout for headless snapshots.
@@ -44,17 +124,38 @@ pub fn run() -> Result<()> {
     #[cfg(target_os = "windows")]
     initialize_windows_npcap()?;
 
-    if let Some(log_level_str) = matches.get_one::<String>("log-level") {
-        let log_level = log_level_str
-            .parse::<LevelFilter>()
-            .map_err(|_| anyhow::anyhow!("Invalid log level: {}", log_level_str))?;
-        setup_logging(log_level, headless)?;
-    } else if headless {
-        CombinedLogger::init(vec![critical_logger(io::stderr())])?;
+    #[cfg(target_os = "macos")]
+    let collector_logging = if let Some((session, _, _)) = &collector {
+        let session = session.lock().unwrap();
+        crate::collector::initialize_logger(
+            &session.directory,
+            std::sync::Arc::clone(&session.diagnostics_failed),
+        )?;
+        true
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "macos"))]
+    let collector_logging = false;
+    if !collector_logging {
+        if let Some(log_level_str) = matches.get_one::<String>("log-level") {
+            let log_level = log_level_str
+                .parse::<LevelFilter>()
+                .map_err(|_| anyhow::anyhow!("Invalid log level: {}", log_level_str))?;
+            setup_logging(log_level, headless)?;
+        } else if headless {
+            CombinedLogger::init(vec![critical_logger(io::stderr())])?;
+        }
     }
 
     // Check privileges BEFORE initializing TUI (so error messages are visible)
-    check_privileges_early()?;
+    #[cfg(target_os = "macos")]
+    let preauthorized = collector.is_some() && rustnet_capture::delegated::is_prepared();
+    #[cfg(not(target_os = "macos"))]
+    let preauthorized = false;
+    if !preauthorized {
+        check_privileges_early()?;
+    }
 
     if let Some(interface) = matches.get_one::<String>("interface") {
         config.interface = Some(interface.to_string());
@@ -200,7 +301,34 @@ pub fn run() -> Result<()> {
     // entire group passes the authoritative opened-handle check.
     // Retaining these descriptors also avoids reopening paths after the UID
     // drop or granting pathname write access through the sandbox.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    let prepared = if collector.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The ordinary collector owns an exclusively-created private session.
+        // Open its connection log once and give App the supported retained handle.
+        let json_log = config
+            .json_log_file
+            .as_ref()
+            .map(|path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+            })
+            .transpose()?;
+        Ok((
+            app::AppOutputHandles {
+                json_log,
+                ..app::AppOutputHandles::default()
+            },
+            None,
+        ))
+    } else {
+        app::prepare_output_handles_for_invoking_uid(&config, invoking_output_uid())
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
     let prepared = app::prepare_output_handles_for_invoking_uid(&config, invoking_output_uid());
     #[cfg(not(unix))]
     let prepared = app::prepare_output_handles(&config);
@@ -349,10 +477,18 @@ pub fn run() -> Result<()> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let read_paths: Vec<PathBuf> = Vec::new();
 
+        #[cfg(target_os = "macos")]
+        let write_paths = collector
+            .as_ref()
+            .map(|(_, paths, _)| vec![paths.data.clone(), paths.runtime.clone()])
+            .unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        let write_paths = Vec::new();
         let sandbox_config = SandboxConfig {
             mode: sandbox_mode,
             block_network: true, // RustNet is passive, doesn't need TCP
             read_paths,
+            write_paths,
             ..SandboxConfig::default()
         };
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -375,7 +511,26 @@ pub fn run() -> Result<()> {
     app.start_workers(worker_startup_permit)?;
 
     if headless {
-        return run_headless(&matches, &mut app, traffic_cadence);
+        #[cfg(target_os = "macos")]
+        if let Some((session, paths, status)) = collector {
+            session.lock().unwrap().start_sampling()?;
+            let auxiliary = crate::collector::Auxiliary::start(
+                &app,
+                std::sync::Arc::clone(&session),
+                paths,
+                status,
+                &SHUTDOWN_REQUESTED,
+            )?;
+            let result = run_headless(
+                &matches,
+                &mut app,
+                traffic_cadence,
+                Box::new(crate::collector::SessionWriter::new(session)),
+            );
+            let finish = auxiliary.finish();
+            return result.and(finish);
+        }
+        return run_headless(&matches, &mut app, traffic_cadence, Box::new(io::stdout()));
     }
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -418,6 +573,7 @@ fn run_headless(
     matches: &clap::ArgMatches,
     app: &mut app::App,
     traffic_cadence: Option<crate::headless::TrafficCadence>,
+    writer: Box<dyn io::Write + Send>,
 ) -> Result<()> {
     let format = matches
         .get_one::<String>("output")
@@ -438,7 +594,7 @@ fn run_headless(
     ) {
         crate::headless::run_process_traffic(
             app,
-            io::stdout(),
+            writer,
             &options,
             crate::headless::TrafficThresholds {
                 upload: *upload,
@@ -448,7 +604,7 @@ fn run_headless(
             &SHUTDOWN_REQUESTED,
         )
     } else {
-        crate::headless::run(app, io::stdout(), &options, &SHUTDOWN_REQUESTED)
+        crate::headless::run(app, writer, &options, &SHUTDOWN_REQUESTED)
     };
     let stop_report = match result {
         Ok(outcome) => outcome,
@@ -485,49 +641,6 @@ fn critical_logger<W: io::Write + Send + 'static>(output: W) -> Box<dyn SharedLo
             .build(),
         output,
     )
-}
-
-#[cfg(test)]
-mod critical_log_tests {
-    use super::*;
-    use log::Log;
-    use std::sync::{Arc, Mutex};
-    #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-    impl io::Write for Buffer {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    #[test]
-    fn headless_critical_messages_remain_visible_with_optional_file_logging_off() {
-        let output = Buffer::default();
-        let logger = CombinedLogger::new(vec![
-            WriteLogger::new(LevelFilter::Off, ConfigBuilder::new().build(), io::sink()),
-            critical_logger(output.clone()),
-        ]);
-        for (level, label) in [
-            (log::Level::Info, "ordinary"),
-            (log::Level::Warn, "warning"),
-            (log::Level::Error, "failure"),
-        ] {
-            logger.log(
-                &log::Record::builder()
-                    .args(format_args!("{}-probe", label))
-                    .level(level)
-                    .target("collector-probe")
-                    .build(),
-            );
-        }
-        logger.flush();
-        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("warning-probe") && text.contains("failure-probe"));
-        assert!(!text.contains("ordinary-probe"));
-    }
 }
 
 fn setup_logging(level: LevelFilter, headless: bool) -> Result<()> {
@@ -620,13 +733,13 @@ fn chown_to_uid_drop_target(
 
 /// Set from the signal handler; the UI loop exits through its normal
 /// cleanup path (flush outputs, restore the terminal) when it flips.
-static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+pub(crate) static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Route termination signals through the regular shutdown path so output is
 /// flushed and an interactive terminal can be restored.
 #[cfg(unix)]
-fn install_signal_handlers() -> io::Result<()> {
+pub(crate) fn install_signal_handlers() -> io::Result<()> {
     extern "C" fn on_signal(_sig: libc::c_int) {
         // Only async-signal-safe work here: set the flag, nothing else.
         SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -764,4 +877,47 @@ fn initialize_windows_npcap() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod critical_log_tests {
+    use super::*;
+    use log::Log;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn headless_critical_messages_remain_visible_with_optional_file_logging_off() {
+        let output = Buffer::default();
+        let logger = CombinedLogger::new(vec![
+            WriteLogger::new(LevelFilter::Off, ConfigBuilder::new().build(), io::sink()),
+            critical_logger(output.clone()),
+        ]);
+        for (level, label) in [
+            (log::Level::Info, "ordinary"),
+            (log::Level::Warn, "warning"),
+            (log::Level::Error, "failure"),
+        ] {
+            logger.log(
+                &log::Record::builder()
+                    .args(format_args!("{}-probe", label))
+                    .level(level)
+                    .target("collector-probe")
+                    .build(),
+            );
+        }
+        logger.flush();
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("warning-probe") && text.contains("failure-probe"));
+        assert!(!text.contains("ordinary-probe"));
+    }
 }

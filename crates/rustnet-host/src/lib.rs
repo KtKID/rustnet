@@ -182,6 +182,9 @@ impl LocalPortStatus {
 #[derive(Debug, Clone, Default)]
 pub struct SocketSnapshot {
     pub sockets: Arc<[HostSocket]>,
+    /// Each completed scan carries an observation time, including empty scans.
+    pub collected_at: Option<std::time::SystemTime>,
+    pub complete: bool,
     local_ports: Option<Arc<HashSet<(Protocol, IpAddr, u16)>>>,
     /// Start of a complete scan with sufficient visibility to prove absence.
     /// `None` means this inventory is useful for display/attribution only.
@@ -215,6 +218,8 @@ impl SocketSnapshot {
         });
         Self {
             sockets: sockets.into(),
+            collected_at: Some(std::time::SystemTime::now()),
+            complete,
             local_ports,
             closure_scan_started: None,
         }
@@ -224,6 +229,7 @@ impl SocketSnapshot {
     /// use it to classify newly observed connection attempts.
     pub fn invalidate_port_status(&mut self) {
         self.local_ports = None;
+        self.complete = false;
     }
 
     /// Match a local endpoint without scanning sockets on the capture thread.
@@ -266,6 +272,7 @@ impl SocketSnapshot {
     }
 }
 
+#[cfg(any(test, target_os = "freebsd", target_os = "windows"))]
 pub(crate) fn remote_if_present(addr: SocketAddr) -> Option<SocketAddr> {
     (addr.port() != 0 || !addr.ip().is_unspecified()).then_some(addr)
 }
@@ -591,6 +598,7 @@ where
 /// rows survive and `remote_if_present` reads them as "no peer". The caller
 /// supplies the wildcard address family from the inventory row.
 #[cfg(any(test, target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(test, target_os = "freebsd"))]
 pub(crate) fn parse_socket_addr_text(addr_str: &str, wildcard: IpAddr) -> Option<SocketAddr> {
     fn parse_port(port_str: &str) -> Option<u16> {
         if port_str == "*" {
@@ -758,13 +766,13 @@ pub use lifecycle::{LifecycleTracker, TrackedConnection};
 
 pub mod procfs;
 
-#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "freebsd"))]
 mod command;
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 mod lsof;
 #[cfg(target_os = "macos")]
 mod macos;

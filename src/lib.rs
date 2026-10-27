@@ -18,6 +18,8 @@
 pub mod app;
 pub mod bootstrap;
 pub mod cli;
+#[cfg(target_os = "macos")]
+pub mod collector;
 pub mod config;
 pub(crate) mod export;
 pub(crate) mod filter;

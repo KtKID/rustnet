@@ -1,5 +1,6 @@
 // macOS process attribution: PKTAP packet metadata when active, else lsof.
 
+mod native;
 mod process;
 
 use process::MacOSProcessLookup;
@@ -83,7 +84,7 @@ pub fn create_process_lookup(use_pktap: bool) -> Result<Box<dyn ProcessLookup>> 
             socket_lookup: MacOSProcessLookup::new()?,
         }))
     } else {
-        log::info!("Using macOS process lookup (lsof)");
+        log::info!("Using macOS process lookup (libproc)");
         Ok(Box::new(MacOSProcessLookup::new()?))
     }
 }

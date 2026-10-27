@@ -2,6 +2,25 @@ use anyhow::Result;
 use std::{env, fs::File, path::PathBuf};
 
 fn main() -> Result<()> {
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|r| r.status.success())
+        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=RUSTNET_COLLECTOR_SOURCE={revision}");
+    if let Some(path) = std::process::Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()
+        .filter(|r| r.status.success())
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            String::from_utf8_lossy(&path.stdout).trim()
+        );
+    }
     generate_assets()?;
 
     setup_cross_compilation_libs();

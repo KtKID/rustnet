@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::network::{
-    capture::{CaptureConfig, CapturedPacket, PacketReader, setup_packet_capture},
+    capture::{CaptureConfig, CapturedPacket, PacketReader, setup_packet_reader},
     dns::DnsResolver,
     parser::{PacketParser, ParsedPacket, ParserConfig},
     tracker::{ConnectionTracker, IngestOutcome},
@@ -64,7 +64,7 @@ pub(super) enum LinktypeWait {
 /// Capture resources opened during the privileged startup phase and moved
 /// into the capture worker only after the sandbox has been applied.
 pub(super) struct PreparedCapture {
-    capture: pcap::Capture<pcap::Active>,
+    capture: PacketReader,
     device_name: String,
     packet_tx: Sender<Vec<CapturedPacket>>,
     pcap_writer: Option<ClassicPcapWriter>,
@@ -488,7 +488,7 @@ impl App {
         let capture_snaplen = capture_config.snaplen as u32;
         *self.capture_status.write().unwrap() = CaptureStatus::Healthy;
 
-        match setup_packet_capture(capture_config) {
+        match setup_packet_reader(capture_config) {
             Ok((capture, device_name, linktype)) => {
                 *self.current_interface.write().unwrap() = Some(device_name.clone());
                 *self.linktype.write().unwrap() = Some(linktype);
@@ -609,7 +609,7 @@ impl App {
         self.runtime
             .spawn_monitored("pcap_tx", move || {
                     info!("Packet capture worker started on interface: {}", device_name);
-                    let mut reader = PacketReader::new(capture);
+                    let mut reader = capture;
                     let mut packets_read = 0u64;
                     let mut pre_attribution_packets = 0u64;
                     let mut last_log = Instant::now();

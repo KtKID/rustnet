@@ -29,6 +29,7 @@ mod tests;
 pub const SCHEMA_VERSION: u8 = 1;
 
 const MAX_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(test)]
 const OUTPUT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Machine-readable output mode.
@@ -137,13 +138,8 @@ pub fn run<W: Write + Send + 'static>(
     options: &HeadlessOptions,
     shutdown_requested: &AtomicBool,
 ) -> Result<StopReport> {
-    run_with_writer_deadline(
-        app,
-        writer,
-        options,
-        shutdown_requested,
-        OUTPUT_SHUTDOWN_DEADLINE,
-    )
+    let deadline = app.output_shutdown_deadline();
+    run_with_writer_deadline(app, writer, options, shutdown_requested, deadline)
 }
 
 fn run_with_writer_deadline<W: Write + Send + 'static>(

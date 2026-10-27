@@ -494,6 +494,16 @@ impl App {
         Duration::from_millis(self.config.refresh_interval)
     }
 
+    pub(crate) fn shared_socket_snapshot(&self) -> Arc<RwLock<SocketSnapshot>> {
+        Arc::clone(&self.socket_snapshot)
+    }
+    pub(crate) fn event_output_queue_capacity(&self) -> usize {
+        self.config.event_output_queue_capacity
+    }
+    pub(crate) fn output_shutdown_deadline(&self) -> Duration {
+        Duration::from_millis(self.config.output_shutdown_deadline_ms)
+    }
+
     /// Count the unfiltered UI snapshot without cloning connection records.
     pub(crate) fn get_connection_counts(&self) -> ConnectionCounts {
         let hide_ptr_lookups = self.hide_ptr_lookups();

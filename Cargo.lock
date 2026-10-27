@@ -2643,9 +2643,12 @@ name = "rustnet-capture"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "cc",
  "libc",
  "log",
  "pcap",
+ "serde",
+ "serde_json",
  "windows 0.62.2",
 ]
 
@@ -2675,6 +2678,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
+ "cc",
  "ferrisetw",
  "libbpf-cargo",
  "libbpf-rs",
@@ -2712,9 +2716,11 @@ dependencies = [
  "rustnet-sandbox",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.11.1",
  "simplelog",
  "toml",
+ "uuid",
  "windows 0.62.2",
  "zip",
 ]
@@ -2850,6 +2856,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -3395,6 +3414,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

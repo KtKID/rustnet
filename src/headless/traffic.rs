@@ -14,9 +14,8 @@ use super::schema::{
     ConnectionSnapshot, ProcessSnapshot, RuntimePhase, RuntimeSnapshot, StatsSnapshot, timestamp,
 };
 use super::{
-    HeadlessOptions, MAX_STOP_POLL_INTERVAL, OUTPUT_SHUTDOWN_DEADLINE, SCHEMA_VERSION,
-    TerminationReason, exit_reason, fail_if_runtime_unhealthy, runtime_failure, shutdown_failure,
-    sleep_duration,
+    HeadlessOptions, MAX_STOP_POLL_INTERVAL, SCHEMA_VERSION, TerminationReason, exit_reason,
+    fail_if_runtime_unhealthy, runtime_failure, shutdown_failure, sleep_duration,
 };
 use crate::app::{App, StopReport};
 use crate::network::types::Connection;
@@ -202,13 +201,14 @@ pub fn run_process_traffic<W: Write + Send + 'static>(
         usable_rate(limits.upload).is_some() && usable_rate(limits.download).is_some(),
         "invalid process traffic thresholds"
     );
-    let mut output = match AsyncOutput::spawn(writer) {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = app.stop();
-            return Err(error.into());
-        }
-    };
+    let mut output =
+        match AsyncOutput::spawn_with_capacity(writer, app.event_output_queue_capacity()) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = app.stop();
+                return Err(error.into());
+            }
+        };
     let started = Instant::now();
     let poll = MAX_STOP_POLL_INTERVAL;
     let mut schedule = CadenceTracker::new(cadence);
@@ -259,8 +259,9 @@ pub fn run_process_traffic<W: Write + Send + 'static>(
                     next_check = now + next_interval;
                 }
                 if !events.is_empty() {
-                    anomalies += events.len() as u64;
+                    let admitted = events.len() as u64;
                     output.offer_event(TrafficOutput::Events(events))?;
+                    anomalies += admitted;
                 }
             }
             if let Some(exit) = exit_reason(options.duration, shutdown_requested, started) {
@@ -310,8 +311,14 @@ pub fn run_process_traffic<W: Write + Send + 'static>(
         ),
         stats: StatsSnapshot::from_stats(&app.get_stats()),
     }));
-    output.finish_events(summary, OUTPUT_SHUTDOWN_DEADLINE)?;
-    monitor?;
+    let flushed = output.finish_events(summary, app.output_shutdown_deadline());
+    if let Err(error) = monitor {
+        return match flushed {
+            Ok(()) => Err(error),
+            Err(flush) => Err(anyhow::anyhow!("{error:#}; output completion: {flush:#}")),
+        };
+    }
+    flushed?;
     if let Some(failure) = failure {
         return Err(failure.error);
     }
@@ -331,6 +338,7 @@ fn detect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headless::OUTPUT_SHUTDOWN_DEADLINE;
     use crate::network::types::{Protocol, ProtocolState};
 
     fn fixed_cadence(ms: u64) -> TrafficCadence {

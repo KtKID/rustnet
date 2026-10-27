@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "freebsd")]
 pub(crate) const PROCESS_TABLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);

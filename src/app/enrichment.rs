@@ -139,6 +139,11 @@ impl App {
         };
         let shutdown = self.runtime.shutdown_signal();
         let failure_shutdown = shutdown.clone();
+        let cadence = (
+            self.config.enrichment_interval_ms,
+            self.config.enrichment_full_interval_ms,
+            self.config.socket_refresh_interval_ms,
+        );
         #[cfg(feature = "kubernetes")]
         let kubernetes_mode = self.config.kubernetes_mode;
 
@@ -152,6 +157,7 @@ impl App {
                     shutdown,
                     socket_snapshot,
                     report_closed,
+                    cadence,
                     #[cfg(feature = "kubernetes")]
                     kubernetes_mode,
                 ) {
@@ -184,6 +190,7 @@ impl App {
         shutdown: ShutdownSignal,
         socket_snapshot: Arc<RwLock<rustnet_host::SocketSnapshot>>,
         report_closed: impl Fn(&Connection, SystemTime),
+        cadence: (u64, u64, u64),
         #[cfg(feature = "kubernetes")] kubernetes_mode: crate::network::kubernetes::KubernetesMode,
     ) -> Result<()> {
         if shutdown.is_requested() {
@@ -217,8 +224,9 @@ impl App {
         // never resolve) are retried only on the full pass so the fast
         // tick stays cheap, and fully attributed connections are skipped
         // entirely.
-        let tick = Duration::from_millis(250);
-        let full_pass_interval = Duration::from_secs(2);
+        let tick = Duration::from_millis(cadence.0);
+        let full_pass_interval = Duration::from_millis(cadence.1);
+        let socket_interval = Duration::from_millis(cadence.2);
         // Connections younger than this are retried on every fast tick.
         const YOUNG_CONNECTION_SECS: u64 = 10;
         let mut last_full_pass = Instant::now() - full_pass_interval;
@@ -244,7 +252,7 @@ impl App {
                 break;
             }
 
-            if last_refresh.elapsed() > Duration::from_secs(5) {
+            if last_refresh.elapsed() >= socket_interval {
                 if let Err(e) = process_lookup.refresh_interruptible(shutdown.requested_flag()) {
                     debug!("Process lookup refresh failed: {}", e);
                     if let Ok(mut snapshot) = socket_snapshot.write() {

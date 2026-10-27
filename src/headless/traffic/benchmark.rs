@@ -31,7 +31,9 @@ fn controlled_pipeline() {
         scenario.as_str(),
         "normal" | "upload" | "download" | "both"
     ));
-    assert!(count > 0 && count <= 50_000 && process_count > 0 && count % process_count == 0);
+    assert!(
+        count > 0 && count <= 50_000 && process_count > 0 && count.is_multiple_of(process_count)
+    );
     let mut app = App::new(Config {
         resolve_dns: false,
         refresh_interval: 1000,

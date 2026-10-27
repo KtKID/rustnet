@@ -31,8 +31,15 @@ pub(super) struct AsyncOutput<T> {
 }
 
 impl<T: Serialize + Send + 'static> AsyncOutput<T> {
-    pub(super) fn spawn<W: Write + Send + 'static>(mut writer: W) -> io::Result<Self> {
-        let (records_tx, records_rx) = bounded::<OutputRecord<T>>(1);
+    pub(super) fn spawn<W: Write + Send + 'static>(writer: W) -> io::Result<Self> {
+        Self::spawn_with_capacity(writer, 1)
+    }
+
+    pub(super) fn spawn_with_capacity<W: Write + Send + 'static>(
+        mut writer: W,
+        capacity: usize,
+    ) -> io::Result<Self> {
+        let (records_tx, records_rx) = bounded::<OutputRecord<T>>(capacity);
         let pending_rx = records_rx.clone();
         let (status_tx, status_rx) = bounded(1);
         let worker = thread::Builder::new()

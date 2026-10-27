@@ -5,6 +5,14 @@ fn main() -> Result<()> {
     // Compile eBPF programs on Linux when the feature is enabled.
     // Check the TARGET/feature env vars (not cfg!) to handle cross-compilation.
     let target = env::var("TARGET").unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    if target.contains("apple-darwin") {
+        cc::Build::new()
+            .file("src/macos/socket_info.c")
+            .warnings(true)
+            .compile("rustnet_socket_info");
+        println!("cargo:rerun-if-changed=src/macos/socket_info.c");
+    }
     if target.contains("linux") && env::var("CARGO_FEATURE_EBPF").is_ok() {
         compile_ebpf_programs();
     }

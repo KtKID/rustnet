@@ -58,6 +58,11 @@ pub struct Config {
     pub filter_localhost: bool,
     /// UI refresh interval in milliseconds
     pub refresh_interval: u64,
+    pub socket_refresh_interval_ms: u64,
+    pub enrichment_interval_ms: u64,
+    pub enrichment_full_interval_ms: u64,
+    pub event_output_queue_capacity: usize,
+    pub output_shutdown_deadline_ms: u64,
     /// Enable deep packet inspection
     pub enable_dpi: bool,
     /// BPF filter for packet capture
@@ -91,6 +96,11 @@ impl Default for Config {
             interface: None,
             filter_localhost: true,
             refresh_interval: 500,
+            socket_refresh_interval_ms: 5000,
+            enrichment_interval_ms: 250,
+            enrichment_full_interval_ms: 2000,
+            event_output_queue_capacity: 1,
+            output_shutdown_deadline_ms: 2000,
             enable_dpi: true,
             bpf_filter: None, // No filter by default to see all packets
             json_log_file: None,

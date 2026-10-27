@@ -19,6 +19,19 @@ use pcap::{Active, Capture, Device, Error as PcapError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod capture_wait;
+#[cfg(target_os = "macos")]
+pub mod delegated;
+
+/// The collector can receive an initialized BPF descriptor from a short-lived
+/// privileged startup helper. Ordinary RustNet callers use libpcap directly.
+pub fn setup_packet_reader(config: CaptureConfig) -> Result<(PacketReader, String, i32)> {
+    #[cfg(target_os = "macos")]
+    if let Some((reader, device, linktype)) = delegated::take_reader()? {
+        return Ok((reader, device, linktype));
+    }
+    setup_packet_capture(config)
+        .map(|(capture, device, linktype)| (PacketReader::new(capture), device, linktype))
+}
 
 /// Why the macOS PKTAP fast path could not be used during capture setup.
 ///
@@ -534,8 +547,10 @@ const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// spinning. Native capture readiness wakes the wait early where supported;
 /// otherwise a short sleep bounds idle polling. Neither path requires traffic.
 pub struct PacketReader {
-    capture: Capture<Active>,
-    idle_wait: capture_wait::CaptureWait,
+    capture: Option<Capture<Active>>,
+    idle_wait: Option<capture_wait::CaptureWait>,
+    #[cfg(target_os = "macos")]
+    delegated: Option<delegated::BpfReader>,
 }
 
 /// A captured link-layer frame with the timestamp reported by libpcap/Npcap.
@@ -549,15 +564,26 @@ pub struct CapturedPacket {
 impl PacketReader {
     pub fn new(capture: Capture<Active>) -> Self {
         let idle_wait = capture_wait::CaptureWait::new(&capture);
-        Self { capture, idle_wait }
+        Self {
+            capture: Some(capture),
+            idle_wait: Some(idle_wait),
+            #[cfg(target_os = "macos")]
+            delegated: None,
+        }
     }
 
     /// Read the next packet, returning `None` after a bounded idle delay when
     /// no packet is available. Captures supplied directly must be nonblocking.
     pub fn next_packet(&mut self) -> Result<Option<CapturedPacket>> {
-        match self.capture.next_packet() {
+        #[cfg(target_os = "macos")]
+        if let Some(reader) = &mut self.delegated {
+            return reader.next_packet();
+        }
+        let capture = self.capture.as_mut().expect("pcap reader");
+        let idle_wait = self.idle_wait.as_mut().expect("pcap wait");
+        match capture.next_packet() {
             Ok(packet) => {
-                self.idle_wait.packet_received();
+                idle_wait.packet_received();
                 let ts = packet.header.ts;
                 Ok(Some(CapturedPacket {
                     data: packet.data.to_vec(),
@@ -566,7 +592,7 @@ impl PacketReader {
                 }))
             }
             Err(PcapError::TimeoutExpired) => {
-                self.idle_wait.wait(&self.capture);
+                idle_wait.wait(capture);
                 Ok(None)
             }
             Err(e) => Err(e.into()),
@@ -575,7 +601,11 @@ impl PacketReader {
 
     /// Get capture statistics
     pub fn stats(&mut self) -> Result<CaptureStats> {
-        let stats = self.capture.stats()?;
+        #[cfg(target_os = "macos")]
+        if let Some(reader) = &mut self.delegated {
+            return reader.stats();
+        }
+        let stats = self.capture.as_mut().expect("pcap reader").stats()?;
         let capture_stats = CaptureStats {
             received: stats.received,
             dropped: stats.dropped,
