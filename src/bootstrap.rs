@@ -7,7 +7,7 @@ use crate::{app, cli, config, network, ui};
 use anyhow::{Context, Result};
 use log::{LevelFilter, info, warn};
 use ratatui::prelude::CrosstermBackend;
-use simplelog::{ConfigBuilder, WriteLogger};
+use simplelog::{CombinedLogger, ConfigBuilder, SharedLogger, WriteLogger};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -48,7 +48,9 @@ pub fn run() -> Result<()> {
         let log_level = log_level_str
             .parse::<LevelFilter>()
             .map_err(|_| anyhow::anyhow!("Invalid log level: {}", log_level_str))?;
-        setup_logging(log_level)?;
+        setup_logging(log_level, headless)?;
+    } else if headless {
+        CombinedLogger::init(vec![critical_logger(io::stderr())])?;
     }
 
     // Check privileges BEFORE initializing TUI (so error messages are visible)
@@ -473,7 +475,62 @@ fn ensure_clean_shutdown(report: app::StopReport) -> Result<()> {
     Ok(())
 }
 
-fn setup_logging(level: LevelFilter) -> Result<()> {
+fn critical_logger<W: io::Write + Send + 'static>(output: W) -> Box<dyn SharedLogger> {
+    WriteLogger::new(
+        LevelFilter::Warn,
+        ConfigBuilder::new()
+            .set_time_level(LevelFilter::Warn)
+            .set_target_level(LevelFilter::Warn)
+            .set_time_format_rfc3339()
+            .build(),
+        output,
+    )
+}
+
+#[cfg(test)]
+mod critical_log_tests {
+    use super::*;
+    use log::Log;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn headless_critical_messages_remain_visible_with_optional_file_logging_off() {
+        let output = Buffer::default();
+        let logger = CombinedLogger::new(vec![
+            WriteLogger::new(LevelFilter::Off, ConfigBuilder::new().build(), io::sink()),
+            critical_logger(output.clone()),
+        ]);
+        for (level, label) in [
+            (log::Level::Info, "ordinary"),
+            (log::Level::Warn, "warning"),
+            (log::Level::Error, "failure"),
+        ] {
+            logger.log(
+                &log::Record::builder()
+                    .args(format_args!("{}-probe", label))
+                    .level(level)
+                    .target("collector-probe")
+                    .build(),
+            );
+        }
+        logger.flush();
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("warning-probe") && text.contains("failure-probe"));
+        assert!(!text.contains("ordinary-probe"));
+    }
+}
+
+fn setup_logging(level: LevelFilter, headless: bool) -> Result<()> {
     let log_dir = Path::new("logs");
     #[cfg(not(unix))]
     if !log_dir.exists() {
@@ -506,7 +563,11 @@ fn setup_logging(level: LevelFilter) -> Result<()> {
         .set_target_level(LevelFilter::Error)
         .build();
 
-    WriteLogger::init(level, config, log_file)?;
+    let mut loggers: Vec<Box<dyn SharedLogger>> = vec![WriteLogger::new(level, config, log_file)];
+    if headless {
+        loggers.push(critical_logger(io::stderr()));
+    }
+    CombinedLogger::init(loggers)?;
 
     // Startup banner: one identifying header so a user grepping a
     // long-lived log file can immediately see which binary, which
