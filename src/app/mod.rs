@@ -6,6 +6,7 @@
 
 mod capture;
 mod enrichment;
+mod live;
 mod logging;
 mod output;
 mod packet_queue;
@@ -19,6 +20,7 @@ mod unix_output;
 #[cfg(target_os = "windows")]
 mod windows_output;
 
+pub(crate) use live::LiveSources;
 #[cfg(unix)]
 pub(crate) use output::create_private_diagnostic_file;
 pub(crate) use output::prepare_output_handles_for_invoking_uid;

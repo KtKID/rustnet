@@ -514,6 +514,11 @@ fn run_inner(matches: clap::ArgMatches, collector: Option<CollectorContext>) -> 
         #[cfg(target_os = "macos")]
         if let Some((session, paths, status)) = collector {
             session.lock().unwrap().start_sampling()?;
+            let live = crate::collector::LiveServer::start(
+                app.live_sources(),
+                paths.runtime.join("live.sock"),
+                session.lock().unwrap().run_id.clone(),
+            )?;
             let auxiliary = crate::collector::Auxiliary::start(
                 &app,
                 std::sync::Arc::clone(&session),
@@ -528,7 +533,8 @@ fn run_inner(matches: clap::ArgMatches, collector: Option<CollectorContext>) -> 
                 Box::new(crate::collector::SessionWriter::new(session)),
             );
             let finish = auxiliary.finish();
-            return result.and(finish);
+            let live_finish = live.finish();
+            return result.and(finish).and(live_finish);
         }
         return run_headless(&matches, &mut app, traffic_cadence, Box::new(io::stdout()));
     }

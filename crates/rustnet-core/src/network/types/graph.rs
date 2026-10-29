@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Chart data points as (time_offset, value) pairs
 pub type ChartData = Vec<(f64, f64)>;
@@ -17,6 +17,8 @@ pub struct ConnectionLifecycleSample {
 #[derive(Debug, Clone)]
 pub struct TrafficSample {
     pub timestamp: Instant,
+    /// Wall clock captured with the sample, stable across live publications.
+    pub observed_at: SystemTime,
     traffic_available: bool,
     pub rx_bytes_per_sec: u64,
     pub tx_bytes_per_sec: u64,
@@ -32,6 +34,20 @@ pub struct TrafficSample {
     pub packets_per_sec: u64,
     pub packet_loss_pct: f32,
     pub avg_rtt_ms: Option<f64>,
+}
+
+impl TrafficSample {
+    pub fn live_rates(&self) -> Option<(u64, u64)> {
+        self.traffic_available
+            .then_some((self.rx_bytes_per_sec, self.tx_bytes_per_sec))
+    }
+
+    pub fn lifecycle_rates(&self) -> (f64, f64) {
+        (
+            self.opened_connections_per_sec_tenths as f64 / 10.0,
+            self.closed_connections_per_sec_tenths as f64 / 10.0,
+        )
+    }
 }
 
 /// Average sampled rates over a trailing time window. Each sample describes
@@ -297,6 +313,7 @@ impl TrafficHistory {
         self.scroll.record_at(timestamp);
         let sample = TrafficSample {
             timestamp,
+            observed_at: SystemTime::now(),
             traffic_available: traffic.is_some(),
             rx_bytes_per_sec,
             tx_bytes_per_sec,
@@ -348,6 +365,11 @@ impl TrafficHistory {
     /// Configured ring-buffer capacity (the graph's sample window).
     pub fn capacity(&self) -> usize {
         self.max_samples
+    }
+
+    /// Exact bounded samples, including gaps, for read-only live consumers.
+    pub fn live_samples(&self) -> impl ExactSizeIterator<Item = &TrafficSample> {
+        self.samples.iter()
     }
 
     pub fn rx_graph_ceiling(&self) -> f64 {

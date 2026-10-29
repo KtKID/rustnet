@@ -19,6 +19,22 @@ mod traffic;
 
 pub use traffic::{TrafficCadence, TrafficThresholds, run_process_traffic};
 
+/// Shared wire projection for the collector's read-only live view.
+pub(crate) fn live_connections(
+    connections: &[crate::network::types::Connection],
+) -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(
+        connections
+            .iter()
+            .map(schema::ConnectionSnapshot::from_connection)
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub(crate) fn live_stats(stats: &crate::app::AppStats) -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(schema::StatsSnapshot::from_stats(stats))
+}
+
 use output::AsyncOutput;
 use schema::{RuntimePhase, SnapshotEnvelope};
 
