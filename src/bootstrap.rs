@@ -508,6 +508,67 @@ fn run_inner(matches: clap::ArgMatches, collector: Option<CollectorContext>) -> 
     // threads (DPI packet processors, enrichment, snapshot, cleanup, collectors).
     // On Linux these inherit the Landlock domain and the dropped capabilities, so
     // a compromise in a DPI parser is contained even when running as root.
+    #[cfg(target_os = "macos")]
+    let security = if let Some((session, paths, _)) = &collector {
+        let security_config = { session.lock().unwrap().config.security.clone() };
+        if let Some(security_config) = security_config.filter(|s| s.enabled) {
+            let directory = session.lock().unwrap().directory.clone();
+            let run_id = session.lock().unwrap().run_id.clone();
+            let diagnostic = std::sync::Arc::new(move |message: String| {
+                crate::collector::record_security_failure(&directory, &message);
+                SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let scope = format!(
+                "macos:{}:{}",
+                unsafe { libc::geteuid() },
+                paths
+                    .config
+                    .capture
+                    .interface
+                    .as_deref()
+                    .unwrap_or("automatic")
+            );
+            let runtime = crate::security::SecurityRuntime::start(
+                &paths.data.join("security"),
+                security_config,
+                run_id,
+                scope,
+                diagnostic,
+            )?;
+            if let Ok(snapshot) = app.shared_socket_snapshot().read()
+                && snapshot.complete
+                && snapshot.collected_at.is_some_and(|at| {
+                    at.elapsed().is_ok_and(|age| {
+                        age <= Duration::from_millis(
+                            paths.config.sampling.socket_interval_ms.saturating_mul(3),
+                        )
+                    })
+                })
+            {
+                let uid = unsafe { libc::geteuid() };
+                runtime.sink.listeners(
+                    snapshot
+                        .sockets
+                        .iter()
+                        .filter(|s| {
+                            s.state
+                                == rustnet_host::HostSocketState::Tcp(
+                                    rustnet_host::HostTcpState::Listen,
+                                )
+                                && s.owner.as_ref().is_some_and(|o| o.uid == Some(uid))
+                        })
+                        .map(|s| s.local_addr)
+                        .collect(),
+                );
+            }
+            app.set_security_sink(Some(runtime.sink.clone()));
+            Some(runtime)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     app.start_workers(worker_startup_permit)?;
 
     if headless {
@@ -534,7 +595,8 @@ fn run_inner(matches: clap::ArgMatches, collector: Option<CollectorContext>) -> 
             );
             let finish = auxiliary.finish();
             let live_finish = live.finish();
-            return result.and(finish).and(live_finish);
+            let security_finish = security.map(|s| s.finish()).unwrap_or(Ok(()));
+            return result.and(finish).and(live_finish).and(security_finish);
         }
         return run_headless(&matches, &mut app, traffic_cadence, Box::new(io::stdout()));
     }

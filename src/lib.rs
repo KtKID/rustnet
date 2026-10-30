@@ -28,6 +28,7 @@ pub mod network;
 #[cfg(test)]
 #[path = "test_support/scratch_dir.rs"]
 mod scratch_dir;
+pub mod security;
 mod tui;
 pub mod ui;
 

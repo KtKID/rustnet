@@ -7,6 +7,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<crate::security::protocol::SecurityConfig>,
     pub schema_version: u8,
     pub mode: Mode,
     #[serde(deserialize_with = "required_option")]
@@ -79,7 +81,17 @@ pub fn load(path: &Path) -> Result<CollectorConfig> {
 
 pub fn parse(text: &str) -> Result<CollectorConfig> {
     let value: CollectorConfig = serde_yaml_ng::from_str(text).context("collector YAML")?;
-    ensure!(value.schema_version == 1, "schema_version must be 1");
+    ensure!(
+        matches!(value.schema_version, 1 | 2),
+        "schema_version must be 1 or 2"
+    );
+    ensure!(
+        (value.schema_version == 2) == value.security.is_some(),
+        "v2 requires security; v1 keeps its original fields"
+    );
+    if let Some(security) = &value.security {
+        security.validate()?;
+    }
     ensure!(
         !value.data_directory.trim().is_empty() && !value.runtime_directory.trim().is_empty(),
         "data/runtime directories must be nonempty"
@@ -148,6 +160,28 @@ pub fn parse(text: &str) -> Result<CollectorConfig> {
 mod tests {
     use super::*;
     #[test]
+    fn security_v2_is_explicit_and_v1_stays_compatible() {
+        let original = include_str!("../../../collector.yaml");
+        let old = original
+            .split("security:\n")
+            .next()
+            .unwrap()
+            .replace("schema_version: 2", "schema_version: 1");
+        assert!(parse(&old).is_ok());
+        let block = include_str!("../security/test-security-config.yaml");
+        let new = old.replace("schema_version: 1", "schema_version: 2") + block;
+        assert!(parse(&new).is_ok(), "v2 security config must be accepted");
+        for bad in [
+            new.replace("scan_distinct_ports: 3", "scan_distinct_ports: 0"),
+            new.replace("tick_ms: 100", "tick_ms: 0"),
+            new.replace("mode: current_user_listeners", "mode: unknown"),
+            old.replace("schema_version: 1", "schema_version: 2"),
+        ] {
+            assert!(parse(&bad).is_err());
+        }
+    }
+
+    #[test]
     fn yaml_is_the_source_of_all_business_values() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../collector.yaml");
         let config = load(&path).expect("valid checked-in YAML");
@@ -177,7 +211,7 @@ mod tests {
                 "traffic_alert_interval_ms: 501",
             ),
             text.replace("mode: anomalies", "mode: other"),
-            text.replace("schema_version: 1", "schema_version: 1\nunknown: true"),
+            text.replace("schema_version: 2", "schema_version: 2\nunknown: true"),
         ] {
             assert!(parse(&bad).is_err(), "accepted {bad}");
         }

@@ -17,3 +17,8 @@ pub(crate) use session::{Session, SessionWriter};
 pub fn main() -> anyhow::Result<()> {
     lifecycle::main()
 }
+
+/// Diagnostic adapter injected into the independent security pipeline.
+pub(crate) fn record_security_failure(directory: &std::path::Path, message: &str) {
+    session::diagnostic(directory, "security", "pipeline_failed", message, "error");
+}

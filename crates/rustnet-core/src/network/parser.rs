@@ -28,6 +28,10 @@ pub struct ParsedIcmpError {
 /// Result of parsing a packet
 #[derive(Debug)]
 pub struct ParsedPacket {
+    /// Actual endpoint membership from the parser local-address snapshot.
+    pub local_is_local: bool,
+    pub remote_is_local: bool,
+    pub observed_interface: Option<String>,
     pub protocol: Protocol,
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
@@ -69,6 +73,9 @@ impl ParsedPacket {
         process_id: Option<u32>,
     ) -> Self {
         Self {
+            local_is_local: false,
+            remote_is_local: false,
+            observed_interface: None,
             protocol,
             local_addr,
             remote_addr,
@@ -295,6 +302,8 @@ impl PacketParser {
     /// parser's interface snapshot.
     pub fn parse_packet(&self, data: &[u8]) -> Option<ParsedPacket> {
         let mut parsed = self.parse_packet_link_layer(data)?;
+        parsed.local_is_local = self.local_ips.contains(&parsed.local_addr.ip());
+        parsed.remote_is_local = self.local_ips.contains(&parsed.remote_addr.ip());
         parsed.local_addr_kind = self.classify_addr(parsed.local_addr.ip());
         parsed.remote_addr_kind = self.classify_addr(parsed.remote_addr.ip());
         parsed.remote_is_gateway = parsed.remote_addr_kind == AddrKind::Unicast
@@ -441,7 +450,7 @@ impl PacketParser {
             payload.len()
         );
 
-        match pktap_header.inner_dlt() {
+        let mut parsed = match pktap_header.inner_dlt() {
             1 => {
                 // DLT_EN10MB - Ethernet frame
                 // Note: macOS/XNU strips 802.1Q VLAN tags in ether_demux() before
@@ -458,7 +467,12 @@ impl PacketParser {
                 log::debug!("Unsupported PKTAP inner DLT: {}", pktap_header.inner_dlt());
                 None
             }
+        }?;
+        let interface = pktap_header.get_interface();
+        if !interface.is_empty() {
+            parsed.observed_interface = Some(interface);
         }
+        Some(parsed)
     }
 
     /// Parse an IPv4 packet from link-layer frame data

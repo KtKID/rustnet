@@ -52,6 +52,8 @@ impl ProcessDetectionStatus {
 /// Application configuration
 #[derive(Debug, Clone)]
 pub struct Config {
+    #[cfg(unix)]
+    pub security_sink: Option<crate::security::SecuritySink>,
     /// Network interface to capture from (None for default)
     pub interface: Option<String>,
     /// Filter localhost connections
@@ -93,6 +95,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            #[cfg(unix)]
+            security_sink: None,
             interface: None,
             filter_localhost: true,
             refresh_interval: 500,

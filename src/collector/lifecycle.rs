@@ -295,14 +295,14 @@ pub(super) fn status(paths: &Paths) -> Result<Value> {
         if !privileged_start {
             if matches!(
                 value["state"].as_str(),
-                Some("running" | "starting" | "stopping")
+                Some("running" | "degraded" | "starting" | "stopping")
             ) {
                 value["state"] = json!("failed");
                 value["error"] = json!("采集进程已退出");
             }
             value["pid"] = Value::Null;
         }
-    } else if value["state"] == "running" {
+    } else if matches!(value["state"].as_str(), Some("running" | "degraded")) {
         let timestamp = DateTime::parse_from_rfc3339(
             value["updated_at"].as_str().context("status timestamp")?,
         )?;
@@ -352,7 +352,7 @@ fn control_start(paths: &Paths) -> Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         let current = status(paths)?;
-        if current["state"] == "running" {
+        if matches!(current["state"].as_str(), Some("running" | "degraded")) {
             println!("{current}");
             return Ok(());
         }
@@ -651,23 +651,27 @@ mod tests {
         assert_eq!(status(&paths).unwrap()["state"], "stopped");
         let mut value = paths.empty_status();
         let (birth, exe) = process_identity(std::process::id()).unwrap();
-        value["state"] = json!("running");
         value["pid"] = json!(std::process::id());
         value["process_start_id"] = json!(birth);
         value["executable"] = json!(exe);
-        session::atomic_json(&paths.status_file(), &value).unwrap();
-        assert_eq!(status(&paths).unwrap()["state"], "running");
-        value["updated_at"] = json!("2020-01-01T00:00:00.000+08:00");
-        session::atomic_json(&paths.status_file(), &value).unwrap();
-        let stale = status(&paths).unwrap();
-        assert_eq!(stale["state"], "failed");
-        assert!(stale["pid"].is_number());
-        value["updated_at"] = json!(session::now());
-        value["process_start_id"] = json!(birth + 1);
-        session::atomic_json(&paths.status_file(), &value).unwrap();
-        let reused = status(&paths).unwrap();
-        assert_eq!(reused["state"], "failed");
-        assert_eq!(reused["pid"], Value::Null);
+        for state in ["running", "degraded"] {
+            value["state"] = json!(state);
+            value["updated_at"] = json!(session::now());
+            value["process_start_id"] = json!(birth);
+            session::atomic_json(&paths.status_file(), &value).unwrap();
+            assert_eq!(status(&paths).unwrap()["state"], state);
+            value["updated_at"] = json!("2020-01-01T00:00:00.000+08:00");
+            session::atomic_json(&paths.status_file(), &value).unwrap();
+            let stale = status(&paths).unwrap();
+            assert_eq!(stale["state"], "failed");
+            assert!(stale["pid"].is_number());
+            value["updated_at"] = json!(session::now());
+            value["process_start_id"] = json!(birth + 1);
+            session::atomic_json(&paths.status_file(), &value).unwrap();
+            let reused = status(&paths).unwrap();
+            assert_eq!(reused["state"], "failed");
+            assert_eq!(reused["pid"], Value::Null);
+        }
         stop_owned(&paths).unwrap();
         assert!(process_identity(std::process::id()).is_some());
         fs::remove_dir_all(root).unwrap();

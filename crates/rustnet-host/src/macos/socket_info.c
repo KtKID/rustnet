@@ -20,6 +20,7 @@ struct rustnet_socket {
 int rustnet_socket_info(int pid, int fd, struct rustnet_socket *out) {
     struct socket_fdinfo info;
     memset(&info, 0, sizeof(info));
+    errno = 0;
     int size = proc_pidfdinfo(pid, fd, PROC_PIDFDSOCKETINFO, &info, sizeof(info));
     if (size != sizeof(info)) return -(errno ? errno : EIO);
     struct socket_info *socket = &info.psi;

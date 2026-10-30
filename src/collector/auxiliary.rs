@@ -21,6 +21,7 @@ impl Auxiliary {
         shutdown: &'static AtomicBool,
     ) -> Result<Self> {
         let snapshots = app.shared_socket_snapshot();
+        let security_sink = app.security_sink();
         let stop = Arc::new(AtomicBool::new(false));
         let request = Arc::clone(&stop);
         let cadence = paths.config.sampling.clone();
@@ -54,7 +55,14 @@ impl Auxiliary {
                                     })
                                 });
                                 if !snapshot.complete || !fresh {
-                                    issue = Some("Socket扫描失败或清单已过期，保留监听基线".into());
+                                    issue = Some(
+                                        if !snapshot.complete {
+                                            "Socket扫描未完成，监听观察受限；保留上次有效基线"
+                                        } else {
+                                            "Socket清单已过期，监听观察受限；保留上次有效基线"
+                                        }
+                                        .into(),
+                                    );
                                     ensure!(
                                         session::diagnostic(
                                             &session.lock().unwrap().directory,
@@ -66,6 +74,24 @@ impl Auxiliary {
                                         "listener diagnostic could not be saved"
                                     );
                                 } else if snapshot.collected_at != last_observation {
+                                    if let Some(sink) = &security_sink {
+                                        let uid = unsafe { libc::geteuid() };
+                                        let endpoints = snapshot
+                                            .sockets
+                                            .iter()
+                                            .filter(|s| {
+                                                s.state
+                                                    == rustnet_host::HostSocketState::Tcp(
+                                                        rustnet_host::HostTcpState::Listen,
+                                                    )
+                                                    && s.owner
+                                                        .as_ref()
+                                                        .is_some_and(|o| o.uid == Some(uid))
+                                            })
+                                            .map(|s| s.local_addr)
+                                            .collect();
+                                        sink.listeners(endpoints);
+                                    }
                                     let timestamp = session::now();
                                     let events =
                                         tracker.update(&snapshot.sockets, &timestamp, true)?;
@@ -87,7 +113,7 @@ impl Auxiliary {
                             status["state"] = json!(if shutdown.load(Ordering::Relaxed) {
                                 "stopping"
                             } else if issue.is_some() {
-                                "failed"
+                                "degraded"
                             } else if ready {
                                 "running"
                             } else {
@@ -148,6 +174,90 @@ impl Drop for Auxiliary {
 mod tests {
     use super::*;
     use std::time::SystemTime;
+    #[test]
+    fn incomplete_inventory_reports_degraded_and_recovers_without_losing_baseline() {
+        let root =
+            std::env::temp_dir().join(format!("collector-degraded-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let config_file = root.join("collector.yaml");
+        std::fs::write(
+            &config_file,
+            include_str!("../../../collector.yaml")
+                .replace("listener_interval_ms: 1000", "listener_interval_ms: 10")
+                .replace("status_interval_ms: 1000", "status_interval_ms: 10"),
+        )
+        .unwrap();
+        let paths = Paths::load(&config_file).unwrap();
+        std::fs::create_dir_all(&paths.data).unwrap();
+        std::fs::create_dir_all(&paths.runtime).unwrap();
+        let session = Arc::new(Mutex::new(
+            Session::create(
+                paths.data.join("session"),
+                paths.config.clone(),
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap(),
+        ));
+        let app = crate::app::App::new(crate::app::Config {
+            resolve_dns: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let snapshots = app.shared_socket_snapshot();
+        {
+            let mut snapshot = snapshots.write().unwrap();
+            snapshot.collected_at = Some(SystemTime::now());
+            snapshot.complete = false;
+        }
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let worker = Auxiliary::start(
+            &app,
+            session.clone(),
+            paths.clone(),
+            paths.empty_status(),
+            &STOP,
+        )
+        .unwrap();
+        let read_state = |wanted: &str| {
+            let until = Instant::now() + Duration::from_millis(500);
+            loop {
+                if let Ok(bytes) = std::fs::read(paths.status_file()) {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    if value["state"] == wanted {
+                        break Some(value);
+                    }
+                }
+                if Instant::now() > until {
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let degraded = read_state("degraded");
+        {
+            let mut snapshot = snapshots.write().unwrap();
+            snapshot.collected_at = Some(SystemTime::now());
+            snapshot.complete = true;
+        }
+        let restored = read_state("running");
+        worker.finish().unwrap();
+        assert!(
+            degraded.is_some(),
+            "a live collector with incomplete listener coverage must report degraded"
+        );
+        assert!(
+            degraded.unwrap()["error"]
+                .as_str()
+                .is_some_and(|x| x.contains("Socket"))
+        );
+        assert!(
+            restored.is_some(),
+            "a complete observation must restore running"
+        );
+        assert!(session.lock().unwrap().listener_scans > 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_valid_initial_inventory_is_ready_with_a_long_socket_interval() {
         let root = std::env::temp_dir().join(format!("collector-ready-{}", uuid::Uuid::new_v4()));

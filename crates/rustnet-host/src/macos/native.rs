@@ -30,6 +30,7 @@ pub(super) fn scan(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
         complete: true,
         ..SocketScan::default()
     };
+    let mut failures = std::collections::BTreeMap::<(&str, i32), usize>::new();
     // SAFETY: null requests the required list capacity; the next call owns a sized buffer.
     let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if count <= 0 {
@@ -72,6 +73,7 @@ pub(super) fn scan(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
             let bytes: i32 = (fds.len() * size_of::<libc::proc_fdinfo>()).try_into()?;
             // SAFETY: the allocation matches PROC_PIDLISTFDS's documented structure.
             let returned = unsafe {
+                *libc::__error() = 0;
                 libc::proc_pidinfo(
                     pid,
                     libc::PROC_PIDLISTFDS,
@@ -82,8 +84,11 @@ pub(super) fn scan(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
             };
             if returned <= 0 {
                 let error = std::io::Error::last_os_error();
-                if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+                if fd_inventory_incomplete(returned, error.raw_os_error().unwrap_or(libc::EIO)) {
                     result.complete = false;
+                    *failures
+                        .entry(("list_fds", error.raw_os_error().unwrap_or(libc::EIO)))
+                        .or_default() += 1;
                 }
                 fds.clear();
                 filled = true;
@@ -104,6 +109,7 @@ pub(super) fn scan(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
         }
         if !filled {
             result.complete = false;
+            *failures.entry(("fd_buffer", libc::EOVERFLOW)).or_default() += 1;
             continue;
         }
         let owner = SocketOwner::new(pid as u32, details.name.clone(), Some(details.uid));
@@ -121,6 +127,7 @@ pub(super) fn scan(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
                     libc::EBADF | libc::ESRCH | libc::ENOENT | libc::ENOTSOCK
                 ) {
                     result.complete = false;
+                    *failures.entry(("socket_info", -status)).or_default() += 1;
                 }
                 continue;
             }
@@ -185,7 +192,14 @@ pub(super) fn scan(cancelled: Option<&AtomicBool>) -> Result<SocketScan> {
             });
         }
     }
+    if !failures.is_empty() {
+        log::warn!("Native socket inventory incomplete: {:?}", failures);
+    }
     Ok(result)
+}
+
+fn fd_inventory_incomplete(returned: i32, errno: i32) -> bool {
+    returned <= 0 && !matches!(errno, libc::ESRCH | libc::ENOENT) && !(returned == 0 && errno == 0)
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
@@ -200,6 +214,19 @@ fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_fd_inventory_and_process_exit_preserve_completeness() {
+        let incomplete = fd_inventory_incomplete;
+        assert!(
+            !incomplete(0, 0),
+            "zero entries with no error is a valid empty inventory"
+        );
+        assert!(!incomplete(0, libc::ESRCH));
+        assert!(!incomplete(-1, libc::ESRCH));
+        assert!(!incomplete(16, libc::EPERM));
+        assert!(incomplete(-1, libc::EPERM));
+    }
+
     #[test]
     fn native_inventory_observes_real_ipv4_ipv6_and_udp() {
         let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

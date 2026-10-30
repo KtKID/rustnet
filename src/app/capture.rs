@@ -70,6 +70,47 @@ pub(super) struct PreparedCapture {
     pcap_writer: Option<ClassicPcapWriter>,
 }
 
+/// Minimal security facts are taken before the DPI/business queue can discard
+/// a batch. The security sink owns its separate bounded queue and loss records.
+#[cfg(unix)]
+struct SecurityPacketTap {
+    parser: PacketParser,
+    sink: crate::security::SecuritySink,
+    interface: String,
+}
+
+#[cfg(unix)]
+impl SecurityPacketTap {
+    fn new(sink: crate::security::SecuritySink, linktype: i32, interface: String) -> Self {
+        Self {
+            parser: PacketParser::with_config(ParserConfig { enable_dpi: false })
+                .with_linktype(linktype),
+            sink,
+            interface,
+        }
+    }
+
+    fn observe(&mut self, packet: &CapturedPacket) {
+        self.parser
+            .refresh_local_ips_if_due(Duration::from_secs(30));
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.parse_packet_with_refresh(&packet.data)
+        }));
+        match parsed {
+            Ok(Some(parsed)) => {
+                if let Some(fact) = crate::security::protocol::PacketFact::from_parsed(
+                    &parsed,
+                    Some(self.interface.clone()),
+                ) {
+                    self.sink.observe_captured(fact, packet.timestamp);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => warn!("security parser panicked on a captured packet"),
+        }
+    }
+}
+
 impl PreparedCapture {
     /// Flush a staged PCAP header if shutdown happens before the capture worker
     /// takes ownership of this prepared resource.
@@ -605,6 +646,17 @@ impl App {
         let should_stop = Arc::clone(&self.should_stop);
         let stats = Arc::clone(&self.stats);
         let capture_status = Arc::clone(&self.capture_status);
+        #[cfg(unix)]
+        let mut security_tap = self.config.security_sink.clone().map(|sink| {
+            SecurityPacketTap::new(
+                sink,
+                self.linktype
+                    .read()
+                    .unwrap()
+                    .expect("prepared capture linktype"),
+                device_name.clone(),
+            )
+        });
 
         self.runtime
             .spawn_monitored("pcap_tx", move || {
@@ -698,6 +750,11 @@ impl App {
                                         pre_attribution_packets.saturating_add(1);
                                     continue;
                                 };
+
+                                #[cfg(unix)]
+                                if let Some(tap) = &mut security_tap {
+                                    tap.observe(&packet);
+                                }
 
                                 packets_read += 1;
 
@@ -1663,6 +1720,53 @@ mod prepared_pcap_tests {
 mod packet_worker_tests {
     use super::*;
     use crate::app::Config;
+
+    #[cfg(unix)]
+    #[test]
+    fn security_observation_survives_a_full_business_packet_queue() {
+        let root = std::env::temp_dir().join(format!("capture-security-{}", uuid::Uuid::new_v4()));
+        let config: std::collections::BTreeMap<String, crate::security::protocol::SecurityConfig> =
+            serde_yaml_ng::from_str(include_str!("../security/test-security-config.yaml")).unwrap();
+        let runtime = crate::security::SecurityRuntime::start(
+            &root,
+            config["security"].clone(),
+            uuid::Uuid::new_v4().to_string(),
+            "test0".into(),
+            Arc::new(|message| panic!("unexpected security failure: {message}")),
+        )
+        .unwrap();
+        let mut tap = SecurityPacketTap::new(runtime.sink.clone(), 1, "test0".into());
+        let (sender, _receiver) = channel::bounded(1);
+        sender.send(Vec::<CapturedPacket>::new()).unwrap();
+        let mut data = tcp_frame(2, 99);
+        data[26..30].copy_from_slice(&[192, 0, 2, 2]);
+        data[30..34].copy_from_slice(&[127, 0, 0, 1]);
+        let packet = CapturedPacket {
+            original_len: data.len() as u32,
+            data,
+            timestamp: SystemTime::now(),
+        };
+        tap.observe(&packet);
+        let stats = AppStats::default();
+        let mut batch = vec![packet];
+        assert!(try_send_packet_batch(&sender, &mut batch, &stats).is_continue());
+        assert_eq!(stats.packets_dropped.load(Ordering::Relaxed), 1);
+        runtime.finish().unwrap();
+        let observations: Vec<_> = crate::security::journal::Journal::replay(&root)
+            .unwrap()
+            .into_iter()
+            .flat_map(|batch| batch.items)
+            .filter_map(|item| match item {
+                crate::security::protocol::Item::Observation(value) => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].result, "attempt_observed");
+        assert_eq!(observations[0].initiator, "inbound");
+        assert_eq!(observations[0].interface.as_deref(), Some("test0"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn udp_frame(marker: u8) -> Vec<u8> {
         // Ethernet/IPv4 UDP from loopback to 198.51.100.10, with a valid

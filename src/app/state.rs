@@ -240,6 +240,15 @@ fn build_geoip_resolver(config: &Config) -> Option<Arc<GeoIpResolver>> {
 }
 
 impl App {
+    #[cfg(unix)]
+    pub fn set_security_sink(&mut self, sink: Option<crate::security::SecuritySink>) {
+        self.config.security_sink = sink;
+    }
+    #[cfg(unix)]
+    pub fn security_sink(&self) -> Option<crate::security::SecuritySink> {
+        self.config.security_sink.clone()
+    }
+
     /// Create a test application with default output handles.
     #[cfg(test)]
     pub(crate) fn new(config: Config) -> Result<Self> {
