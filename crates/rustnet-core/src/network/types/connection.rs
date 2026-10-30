@@ -16,6 +16,7 @@ use super::identity::{
 /// groups them with unattributed connections instead of showing two unknown
 /// buckets side by side.
 pub const UNKNOWN_PROCESS_NAME: &str = "Unknown";
+use super::ProcessObservations;
 use super::protocol_info::{
     ApplicationProtocol, DpiInfo, QuicConnectionState, QuicInfo, QuicPacketType,
 };
@@ -203,6 +204,8 @@ pub struct Connection {
 
     // Process information
     pub pid: Option<u32>,
+    /// Packet-level process evidence; the primary PID remains stable for byte accounting.
+    pub process_observations: ProcessObservations,
     /// Opaque process birth identity for host lifecycle checks. Linux uses
     /// start ticks since boot; this is not a wall-clock timestamp.
     pub process_start_id: Option<u64>,
@@ -363,6 +366,7 @@ impl Connection {
             protocol_state: state,
             network_events: None,
             pid: None,
+            process_observations: ProcessObservations::default(),
             process_start_id: None,
             socket_netns_id: None,
             process_exit_status: None,
@@ -450,6 +454,7 @@ impl Connection {
             protocol_state: self.protocol_state.clone(),
             network_events: self.network_events.clone(),
             pid: self.pid,
+            process_observations: self.process_observations.clone(),
             process_start_id: self.process_start_id,
             socket_netns_id: self.socket_netns_id,
             process_exit_status: self.process_exit_status,

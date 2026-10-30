@@ -45,6 +45,7 @@ use crate::network::dns_analytics::{DnsAnalyticsSnapshot, DnsAnalyticsTracker};
 use crate::network::dns_attribution::DnsAttributionCache;
 use crate::network::merge::{
     TcpMergeEvents, create_connection_from_packet, merge_packet_into_connection,
+    report_process_observations,
 };
 use crate::network::neighbors::{NeighborCache, NeighborEntry};
 use crate::network::parser::ParsedPacket;
@@ -824,7 +825,7 @@ impl ConnectionTracker {
             .get(&key)
             .is_some_and(|conn| Self::packet_starts_new_generation(&conn, parsed));
         let archived = if still_needs_split {
-            self.connections.remove(&key).map(|(_, conn)| {
+            self.connections.remove(&key).map(|(_, mut conn)| {
                 // Historic keys include `created_at`, so two generations of
                 // the same tuple must not share a creation timestamp. This is
                 // possible when several captured packets use one batch time.
@@ -836,6 +837,7 @@ impl ConnectionTracker {
                         .checked_add(Duration::from_nanos(100))
                         .unwrap_or(replacement_now);
                 }
+                report_process_observations(&mut conn, now, true);
                 self.archive_snapshot(key, &conn, now);
                 self.retire(key, &conn, now);
                 conn
@@ -1059,10 +1061,11 @@ impl ConnectionTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed = Vec::new();
         for observed in observations {
-            if let Some((key, conn)) = self
+            if let Some((key, mut conn)) = self
                 .connections
                 .remove_if(&observed.key, |_, conn| observed.matches(conn))
             {
+                report_process_observations(&mut conn, now, true);
                 self.archive_snapshot(key, &conn, now);
                 self.retire(key, &conn, now);
                 removed.push(conn);
@@ -1098,6 +1101,7 @@ impl ConnectionTracker {
 
         self.connections.retain(|key, conn| {
             let should_keep = !conn.should_cleanup(now);
+            report_process_observations(conn, now, !should_keep);
             if !should_keep {
                 removed_keys.push(*key);
                 removed.push(conn.clone());
@@ -1115,6 +1119,13 @@ impl ConnectionTracker {
         self.dns_attribution.cleanup_tick(std::time::Instant::now());
 
         removed
+    }
+
+    /// Persist the remaining shared-process counts after capture producers stop.
+    pub fn flush_process_observations(&self, now: SystemTime) {
+        for mut conn in self.connections.iter_mut() {
+            report_process_observations(&mut conn, now, true);
+        }
     }
 
     /// Inspect the active and historic maps as one consistent retained view.
@@ -1191,6 +1202,7 @@ impl ConnectionTracker {
             .lifecycle
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.flush_process_observations(SystemTime::now());
         self.connections.clear();
         self.active_count.store(0, Ordering::Relaxed);
         self.historic.clear();
@@ -1260,6 +1272,61 @@ mod tests {
     use super::*;
     use crate::network::parser::PacketParser;
     use crate::network::types::NetBiosOpcode;
+
+    #[test]
+    fn shared_process_pending_tail_is_flushed_for_idle_retired_and_stopped_flows() {
+        for finish in 0..3 {
+            let tracker = ConnectionTracker::new();
+            let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+            let mut packet = ParsedPacket::new(
+                Protocol::Tcp,
+                "10.1.10.55:61513".parse().unwrap(),
+                "199.232.211.52:443".parse().unwrap(),
+                ProtocolState::Tcp(crate::network::types::TcpState::Established),
+                true,
+                100,
+                Some("wineserver".into()),
+                Some(76118),
+            );
+            let key = tracker.ingest_at(&packet, start).key;
+            packet.process_id = Some(77203);
+            packet.process_name = Some("steamwebhelper.e".into());
+            for _ in 0..5 {
+                tracker.ingest_at(&packet, start + Duration::from_secs(1));
+            }
+            let end = start + Duration::from_secs(600);
+            let mut final_connection = match finish {
+                0 => tracker.cleanup(end).pop().unwrap(),
+                1 => {
+                    let observation = ConnectionObservation::from_connection(
+                        &tracker.connections().get(&key).unwrap(),
+                    )
+                    .unwrap();
+                    tracker
+                        .retire_if_unchanged([observation], end)
+                        .pop()
+                        .unwrap()
+                }
+                _ => {
+                    tracker.flush_process_observations(end);
+                    tracker.flush_process_observations(end);
+                    tracker.connections().get(&key).unwrap().snapshot_clone()
+                }
+            };
+            assert_eq!(
+                final_connection.process_observations.alternate_observations,
+                5
+            );
+            assert!(
+                final_connection
+                    .process_observations
+                    .take_summary(end, true)
+                    .is_none()
+            );
+            assert_eq!(final_connection.pid, Some(76118));
+            assert_eq!(final_connection.bytes_sent, 600);
+        }
+    }
 
     impl ConnectionTracker {
         /// Wall-clock `ingest_at` shorthand for tests that don't exercise

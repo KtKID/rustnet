@@ -1086,6 +1086,7 @@ impl App {
                 // requested, while capture processors keep draining their
                 // bounded queue. Rebuild once after every producer has joined
                 // so final headless output includes that drained tail.
+                self.tracker.flush_process_observations(SystemTime::now());
                 let final_snapshot = build_connection_snapshot(
                     &self.tracker,
                     &self.service_lookup,

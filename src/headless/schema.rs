@@ -424,6 +424,22 @@ impl ConnectionSnapshot {
                         truncated: lineage.truncated,
                     }
                 }),
+                shared_connection: connection.process_observations.alternate_observations > 0,
+                observed_processes: connection
+                    .process_observations
+                    .processes
+                    .iter()
+                    .map(|p| ObservedProcessSnapshot {
+                        pid: p.pid,
+                        name: p.name.clone(),
+                        observations: p.observations,
+                        first_seen: timestamp(p.first_seen),
+                        last_seen: timestamp(p.last_seen),
+                    })
+                    .collect(),
+                unlisted_process_observations: connection
+                    .process_observations
+                    .overflow_observations,
             })
         } else {
             None
@@ -539,6 +555,18 @@ pub(super) struct ProcessSnapshot {
     gid: Option<u32>,
     attribution_match: Option<&'static str>,
     lineage: Option<ProcessLineageSnapshot>,
+    shared_connection: bool,
+    observed_processes: Vec<ObservedProcessSnapshot>,
+    unlisted_process_observations: u64,
+}
+
+#[derive(Serialize)]
+struct ObservedProcessSnapshot {
+    pid: Option<u32>,
+    name: Option<String>,
+    observations: u64,
+    first_seen: String,
+    last_seen: String,
 }
 
 #[derive(Serialize)]
@@ -887,9 +915,12 @@ mod tests {
                 "gid",
                 "lineage",
                 "name",
+                "observed_processes",
                 "pid",
                 "ppid",
+                "shared_connection",
                 "uid",
+                "unlisted_process_observations",
             ]
         );
         assert_eq!(
@@ -1090,6 +1121,45 @@ mod tests {
         assert!(value["process"]["pid"].is_null());
         assert!(value["process"]["name"].is_null());
         assert!(value["process"]["executable"].is_null());
+    }
+
+    #[test]
+    fn shared_process_snapshot_matches_the_zod_interop_fixture() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_358_000);
+        let mut connection = Connection::new(
+            Protocol::Tcp,
+            "10.1.10.55:61513".parse().unwrap(),
+            "199.232.211.52:443".parse().unwrap(),
+            ProtocolState::Tcp(crate::network::types::TcpState::Established),
+        );
+        connection.created_at = start;
+        connection.last_activity = start + Duration::from_secs(1);
+        connection.pid = Some(76118);
+        connection.process_name = Some("wineserver".into());
+        connection.process_observations.observe(
+            Some(76118),
+            Some(76118),
+            Some("wineserver"),
+            start,
+        );
+        connection.process_observations.observe(
+            Some(76118),
+            Some(77203),
+            Some("steamwebhelper.e"),
+            start + Duration::from_secs(1),
+        );
+        let value = serde_json::to_value(ConnectionSnapshot::from_connection(&connection)).unwrap();
+        assert_eq!(value["process"]["pid"], 76118);
+        assert_eq!(value["process"]["shared_connection"], true);
+        assert_eq!(value["process"]["observed_processes"][1]["pid"], 77203);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../web/tests/fixtures/shared-process-connection.json");
+        if std::env::var_os("X_COLLECTOR_WRITE_SHARED_FIXTURE").is_some() {
+            std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap() + "\n").unwrap();
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value, fixture);
     }
 
     #[test]

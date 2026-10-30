@@ -1,7 +1,6 @@
 //! Connection merging and update utilities.
 
 use log::{debug, warn};
-use std::fmt::Debug;
 use std::time::{Duration, SystemTime};
 
 use crate::network::dpi::{DpiResult, is_partial_sni, try_extract_tls_from_reassembler};
@@ -414,18 +413,21 @@ fn apply_packet(conn: &mut Connection, parsed: &ParsedPacket, now: SystemTime) -
         merge_dpi_info(conn, dpi_result);
     }
 
-    // Once set, process info is immutable to prevent conflicts between sources.
-    if let Some(new_process_name) = &parsed.process_name {
-        adopt_immutable(
-            conn,
-            |c| &mut c.process_name,
-            new_process_name,
-            "process name",
-        );
+    // Shared sockets can legitimately carry metadata from multiple processes.
+    // Keep a coherent primary identity and account for every byte exactly once.
+    if conn.pid.is_none() && parsed.process_id.is_some() {
+        conn.pid = parsed.process_id;
+        conn.process_name = parsed.process_name.clone();
+    } else if conn.process_name.is_none() && conn.pid == parsed.process_id {
+        conn.process_name = parsed.process_name.clone();
     }
-    if let Some(new_pid) = parsed.process_id {
-        adopt_immutable(conn, |c| &mut c.pid, &new_pid, "PID");
-    }
+    conn.process_observations.observe(
+        conn.pid,
+        parsed.process_id,
+        parsed.process_name.as_deref(),
+        observation_time,
+    );
+    report_process_observations(conn, observation_time, false);
 
     let is_terminal = conn.is_terminal();
     if is_terminal {
@@ -439,47 +441,34 @@ fn apply_packet(conn: &mut Connection, parsed: &ParsedPacket, now: SystemTime) -
     tcp_events
 }
 
-/// Adopt `new` into the `slot` field of `conn` the first time it is seen and
-/// treat it as immutable from then on: a later conflicting value is logged
-/// and rejected, a matching one is confirmed at debug level. Keeps PKTAP and
-/// other attribution sources from fighting over a connection's identity.
-///
-/// `slot` is a field accessor rather than a `&mut Option<T>` so the key used
-/// in log lines is only formatted when a line is actually emitted.
-fn adopt_immutable<T: PartialEq + Clone + Debug>(
-    conn: &mut Connection,
-    slot: fn(&mut Connection) -> &mut Option<T>,
-    new: &T,
-    what: &str,
-) {
-    match slot(conn) {
-        None => {
-            *slot(conn) = Some(new.clone());
-            debug!(
-                "🔒 Set IMMUTABLE {} for connection {} from PKTAP: {:?}",
-                what,
-                conn.key(),
-                new
-            );
-        }
-        Some(existing) if existing != new => {
-            let existing = existing.clone();
-            warn!(
-                "🚫 IMMUTABILITY VIOLATION: Attempt to change {} for {} from {:?} to {:?} - REJECTED",
-                what,
-                conn.key(),
-                existing,
-                new
-            );
-        }
-        Some(_) => {
-            debug!(
-                "✅ {} confirmed unchanged for {}: {:?}",
-                what,
-                conn.key(),
-                new
-            );
-        }
+/// Emit bounded summaries, preserving a final pending tail when a flow retires.
+pub fn report_process_observations(conn: &mut Connection, now: SystemTime, force: bool) {
+    if let Some(summary) = conn.process_observations.take_summary(now, force) {
+        let processes: Vec<_> = conn
+            .process_observations
+            .processes
+            .iter()
+            .map(|p| (p.pid, p.name.as_deref()))
+            .collect();
+        warn!(
+            "共享连接归属汇总: {} 主归属 PID {:?}; 观测进程 {:?}; 新增 {} 次, 累计 {} 次; 首次观测距连接创建 {} ms, 最近观测距连接创建 {} ms; 超出明细上限 {} 次",
+            conn.key(),
+            conn.pid,
+            processes,
+            summary.additional,
+            summary.total,
+            summary
+                .first_seen
+                .duration_since(conn.created_at)
+                .unwrap_or_default()
+                .as_millis(),
+            summary
+                .last_seen
+                .duration_since(conn.created_at)
+                .unwrap_or_default()
+                .as_millis(),
+            conn.process_observations.overflow_observations,
+        );
     }
 }
 
@@ -1341,6 +1330,58 @@ mod tests {
         assert_eq!(conn.packets_sent, 1);
         assert_eq!(conn.bytes_sent, 100);
         assert_eq!(conn.packets_received, 0);
+    }
+
+    #[test]
+    fn shared_socket_keeps_coherent_primary_and_counts_each_byte_once_in_both_orders() {
+        for (first, first_name, second, second_name) in [
+            (76118, "wineserver", 77203, "steamwebhelper.e"),
+            (77203, "steamwebhelper.e", 76118, "wineserver"),
+        ] {
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+            let mut packet = create_test_packet(true, false);
+            packet.process_id = Some(first);
+            packet.process_name = Some(first_name.into());
+            let mut conn = create_connection_from_packet(&packet, now);
+            packet.process_id = Some(second);
+            packet.process_name = Some(second_name.into());
+            for _ in 0..10_000 {
+                merge_packet_into_connection(&mut conn, &packet, now + Duration::from_secs(1));
+            }
+            assert_eq!(conn.pid, Some(first));
+            assert_eq!(conn.process_name.as_deref(), Some(first_name));
+            assert_eq!(conn.bytes_sent, 1_000_100);
+            assert_eq!(conn.packets_sent, 10_001);
+            assert_eq!(conn.process_observations.alternate_observations, 10_000);
+            let copy = conn.snapshot_clone();
+            assert_eq!(copy.process_observations.processes.len(), 2);
+            assert_eq!(copy.process_observations.processes[1].pid, Some(second));
+            assert_eq!(copy.process_observations.processes[1].observations, 10_000);
+            // Only the immediate first observation has been reported in this minute.
+            let tail = conn
+                .process_observations
+                .take_summary(now + Duration::from_secs(2), true)
+                .unwrap();
+            assert_eq!(tail.additional, 9_999);
+        }
+    }
+
+    #[test]
+    fn first_known_pid_adopts_its_matching_name_after_name_only_metadata() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut packet = create_test_packet(true, false);
+        packet.process_name = Some("name-only".into());
+        let mut conn = create_connection_from_packet(&packet, now);
+        packet.process_id = Some(77203);
+        packet.process_name = Some("steamwebhelper.e".into());
+        merge_packet_into_connection(&mut conn, &packet, now);
+        assert_eq!(conn.pid, Some(77203));
+        assert_eq!(conn.process_name.as_deref(), Some("steamwebhelper.e"));
+        packet.process_id = None;
+        packet.process_name = Some("wineserver".into());
+        merge_packet_into_connection(&mut conn, &packet, now);
+        assert_eq!(conn.process_name.as_deref(), Some("steamwebhelper.e"));
+        assert_eq!(conn.process_observations.alternate_observations, 0);
     }
 
     #[test]

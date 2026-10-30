@@ -208,6 +208,30 @@ mod tests {
     }
 
     #[test]
+    fn shared_process_evidence_keeps_one_interval_flow_and_one_byte_baseline() {
+        let app = app();
+        let mut connection = flow(Some(76118), 0, 0);
+        let mut sampler = IntervalSampler::default();
+        let now = Instant::now();
+        put(&app, connection.clone());
+        sampler.sample(&app, now, limits());
+        connection.process_observations.observe(
+            Some(76118),
+            Some(77203),
+            Some("steamwebhelper.e"),
+            SystemTime::now(),
+        );
+        connection.bytes_sent = 3_000_000;
+        put(&app, connection);
+        let sample = sampler.sample(&app, now + Duration::from_millis(500), limits());
+        assert_eq!(sample.connections.len(), 1);
+        assert_eq!(sample.connections[0].pid, Some(76118));
+        assert_eq!(sample.connections[0].current_outgoing_rate_bps, 6_000_000.0);
+        assert_eq!(sample.counter_resets, 0);
+        assert_eq!(sampler.previous.len(), 1);
+    }
+
+    #[test]
     fn a_short_burst_has_the_expected_100ms_and_500ms_window_rates() {
         let app = app();
         let mut connection = flow(Some(42), 0, 0);
